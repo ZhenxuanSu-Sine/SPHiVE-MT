@@ -1,4 +1,8 @@
 ## VidEoMT: Your ViT is Secretly Also a Video Segmentation Model
+
+[![Papers with Code: #2 on VSPW](https://paperswithcode.co/api/v1/papers/2602.17807/leaderboard-badge.svg?eval=6283&live=1)](https://paperswithcode.co/benchmark/vspw?task=video-segmentation&eval=6283)
+[![Papers with Code: #2 on YouTube-VIS 2022](https://paperswithcode.co/api/v1/papers/2602.17807/leaderboard-badge.svg?eval=6280&live=1)](https://paperswithcode.co/benchmark/youtube-vis-2022?task=video-segmentation&eval=6280)
+
 **CVPR 2026** · **[📄 Paper](https://arxiv.org/abs/2602.17807)**
 
 **[Narges Norouzi](https://scholar.google.com/citations?user=q7sm490AAAAJ)<sup>1</sup>, [Idil Esen Zulfikar](https://scholar.google.com/citations?user=89vcmSoAAAAJ&hl=en)<sup>2,\*</sup>, [Niccolò Cavagnero](https://scholar.google.com/citations?user=Pr4XHRAAAAAJ)<sup>1,\*</sup>, [Tommie Kerssies](https://tommiekerssies.com)<sup>1</sup>, [Bastian Leibe](https://scholar.google.com/citations?user=ZcULDB0AAAAJ)<sup>2</sup>, [Gijs Dubbelman](https://scholar.google.nl/citations?user=wy57br8AAAAJ)<sup>1</sup>, [Daan de Geus](https://daandegeus.com)<sup>1</sup>**

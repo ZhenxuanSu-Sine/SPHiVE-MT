@@ -110,7 +110,7 @@ class SemanticDatasetVideoMapper:
         }
         return ret
 
-    def select_frames(self, video_length):
+    def select_frames(self, video_length, labeled_indices=None):
         """
         Args:
             video_length (int): length of the video
@@ -118,6 +118,8 @@ class SemanticDatasetVideoMapper:
         Returns:
             selected_idx (list[int]): a list of selected frame indices
         """
+        labeled_indices = [] if labeled_indices is None else list(labeled_indices)
+
         if self.sampling_frame_range * 2 + 1 == self.sampling_frame_num:
             if self.sampling_frame_num > video_length:
                 selected_idx = np.arange(0, video_length)
@@ -127,15 +129,23 @@ class SemanticDatasetVideoMapper:
             else:
                 if video_length == self.sampling_frame_num:
                     start_idx = 0
+                elif labeled_indices:
+                    # Keep at least one supervised frame in a contiguous training clip.
+                    anchor = random.choice(labeled_indices)
+                    min_start = max(0, anchor - self.sampling_frame_num + 1)
+                    max_start = min(anchor, video_length - self.sampling_frame_num)
+                    start_idx = random.randint(min_start, max_start)
                 else:
-                    start_idx = random.randrange(video_length - self.sampling_frame_num)
+                    start_idx = random.randrange(video_length - self.sampling_frame_num + 1)
                 end_idx = start_idx + self.sampling_frame_num
                 selected_idx = np.arange(start_idx, end_idx).tolist()
             if self.reverse_agu and random.random() < 0.5:
                 selected_idx = selected_idx[::-1]
             return selected_idx
 
-        ref_frame = random.randrange(video_length)
+        # For sparse annotations, anchor the sampled clip on a supervised frame
+        # whenever one exists. The other sampled frames remain temporal context.
+        ref_frame = random.choice(labeled_indices) if labeled_indices else random.randrange(video_length)
 
         start_idx = max(0, ref_frame-self.sampling_frame_range)
         end_idx = min(video_length, ref_frame+self.sampling_frame_range + 1)
@@ -157,6 +167,7 @@ class SemanticDatasetVideoMapper:
             return
         ret["instances"] = []
         ori_instances = dataset_dict['instances']
+        gt_valid = dataset_dict.get("gt_valid", [True] * len(dataset_dict["frame_idx"]))
 
         if not ori_instances.has("gt_masks"):
             image_shape = (ret["image"][0].shape[-2], ret["image"][0].shape[-1])
@@ -177,9 +188,19 @@ class SemanticDatasetVideoMapper:
 
         for i in range(len(dataset_dict["frame_idx"])):
             instances = Instances(image_shape)
-            instances.gt_masks = masks[:, i]
+            frame_masks = masks[:, i]
+            instances.gt_masks = frame_masks
             instances.gt_classes = copy.deepcopy(classes)
-            instances.gt_ids = torch.arange(0, masks.size(0))
+
+            # A semantic class behaves like a track in the original VidEoMT VSS
+            # formulation. Mark it absent when its mask is empty, and mark every
+            # target absent on a context-only (unlabelled) frame.
+            gt_ids = torch.arange(0, masks.size(0))
+            visible = frame_masks.flatten(1).any(dim=1)
+            gt_ids[~visible] = -1
+            if not gt_valid[i]:
+                gt_ids.fill_(-1)
+            instances.gt_ids = gt_ids
             ret["instances"].append(instances)
 
         dataset_dict.update(ret)
@@ -205,19 +226,31 @@ class SemanticDatasetVideoMapper:
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
 
         video_length = len(dataset_dict['file_names'])
+        source_gt_valid = dataset_dict.get("gt_valid")
+        if source_gt_valid is None:
+            source_gt_valid = [name is not None for name in dataset_dict["sem_mask_names"]]
+        else:
+            source_gt_valid = [bool(x) for x in source_gt_valid]
+        assert len(source_gt_valid) == video_length
+
         if self.is_train:
-            index_list = self.select_frames(video_length)
+            labeled_indices = [i for i, valid in enumerate(source_gt_valid) if valid]
+            index_list = self.select_frames(video_length, labeled_indices=labeled_indices)
         else:
             index_list = range(video_length)
+        index_list = list(index_list)
         dataset_dict["video_len"] = video_length
         dataset_dict["frame_idx"] = index_list
+        dataset_dict["gt_valid"] = [source_gt_valid[idx] for idx in index_list]
 
         select_filenames = []
         select_sem_seg_file_names = []
+        select_gt_valid = []
 
         for idx in index_list:
             select_filenames.append(dataset_dict['file_names'][idx])
             select_sem_seg_file_names.append(dataset_dict['sem_mask_names'][idx])
+            select_gt_valid.append(source_gt_valid[idx])
         ######################
 
         insid_catid_dic = {}  # ins-cat dict
@@ -226,11 +259,13 @@ class SemanticDatasetVideoMapper:
         for ii_, (file_name, sem_seg_file_name) in enumerate(
                 zip(select_filenames, select_sem_seg_file_names)):
 
+            is_labeled = bool(select_gt_valid[ii_]) and sem_seg_file_name is not None
+
             #####
             if ii_ == 0:
                 image = utils.read_image(file_name, format=self.img_format)
                 dataset_dict['height'], dataset_dict['width'] = image.shape[:2]
-                if sem_seg_file_name is not None and self.is_train:
+                if is_labeled and self.is_train:
                     sem_seg_gt = utils.read_image(sem_seg_file_name, "RGB")
                 else:
                     sem_seg_gt = None
@@ -243,7 +278,7 @@ class SemanticDatasetVideoMapper:
             else:
                 image = utils.read_image(file_name, format=self.img_format)
                 image = transforms.apply_image(image)
-                if sem_seg_file_name is not None and self.is_train:
+                if is_labeled and self.is_train:
                     sem_seg_gt = utils.read_image(sem_seg_file_name, "RGB")
                 else:
                     sem_seg_gt = None
@@ -253,6 +288,11 @@ class SemanticDatasetVideoMapper:
             if sem_seg_gt is not None:
                 # only use for vspw dataset
                 sem_seg_gt = self._vspw_preprocess(sem_seg_gt)
+            elif self.is_train:
+                # Keep context-only frames in the clip while excluding them from
+                # supervision. Filling with ignore makes the existing semantic-mask
+                # tube construction well-defined without inventing background labels.
+                sem_seg_gt = np.full(image.shape[:2], self.ignore_label, dtype=np.int64)
 
             # Pad image and segmentation label here!
             image = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))

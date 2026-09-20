@@ -308,6 +308,18 @@ class SemanticDatasetVideoMapper:
 
         image_shape = (input_images.shape[-2], input_images.shape[-1])
         input_sem_seg = np.stack(input_sem_seg)
+
+        # Unknown/ignore pixels are not background. Carry an explicit validity
+        # mask so matching and mask losses can exclude them later.
+        pixel_valid_masks = input_sem_seg != self.ignore_label
+        dataset_dict["pixel_valid_masks"] = torch.from_numpy(
+            np.ascontiguousarray(pixel_valid_masks)
+        ).bool()
+        dataset_dict["label_exhaustive"] = [
+            bool(select_gt_valid[i] and pixel_valid_masks[i].all())
+            for i in range(len(select_gt_valid))
+        ]
+
         unique_ids = np.unique(input_sem_seg)
 
         instances = Instances(image_shape)

@@ -138,6 +138,10 @@ class VideoHungarianMatcher(nn.Module):
             out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
             # print("out_prob shape: ", out_prob.shape)
             tgt_ids = targets[b]["labels"].to(torch.int64)
+            if tgt_ids.numel() == 0:
+                empty = np.empty((0,), dtype=np.int64)
+                indices.append((empty, empty))
+                continue
             num_classes = out_prob.shape[-1]
             # print("tgt_ids shape: ", tgt_ids)
 

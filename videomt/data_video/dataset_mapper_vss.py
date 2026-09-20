@@ -192,12 +192,9 @@ class SemanticDatasetVideoMapper:
             instances.gt_masks = frame_masks
             instances.gt_classes = copy.deepcopy(classes)
 
-            # A semantic class behaves like a track in the original VidEoMT VSS
-            # formulation. Mark it absent when its mask is empty, and mark every
-            # target absent on a context-only (unlabelled) frame.
+            # Preserve VidEoMT's original semantic-tube identity on labeled
+            # frames. Only context-only frames suppress the target identity.
             gt_ids = torch.arange(0, masks.size(0))
-            visible = frame_masks.flatten(1).any(dim=1)
-            gt_ids[~visible] = -1
             if not gt_valid[i]:
                 gt_ids.fill_(-1)
             instances.gt_ids = gt_ids

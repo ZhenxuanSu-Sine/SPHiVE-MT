@@ -265,16 +265,24 @@ class videomt(nn.Module):
                 ids = targets_per_video['ids'][:, [f]]
                 masks = targets_per_video['masks'][:, [f], :, :]
                 frame_valid = targets_per_video.get("frame_valid")
-                if frame_valid is None:
-                    is_supervised = True
-                else:
-                    is_supervised = bool(frame_valid[f].item())
+                is_supervised = True if frame_valid is None else bool(frame_valid[f].item())
+                pixel_valid = targets_per_video.get("pixel_valid")
+                if pixel_valid is not None:
+                    pixel_valid = pixel_valid[[f], :, :]
+                label_exhaustive = targets_per_video.get("label_exhaustive")
+                is_exhaustive = (
+                    is_supervised
+                    if label_exhaustive is None
+                    else bool(label_exhaustive[f].item())
+                )
                 gt_instances.append(
                     {
                         "labels": labels,
                         "ids": ids,
                         "masks": masks,
                         "frame_valid": is_supervised,
+                        "pixel_valid": pixel_valid,
+                        "label_exhaustive": is_exhaustive,
                     }
                 )
         return outputs, gt_instances
@@ -356,16 +364,43 @@ class videomt(nn.Module):
         gt_instances = []
         for targets_per_video in targets:
             num_frames = len(targets_per_video["instances"])
-            frame_valid = targets_per_video.get("gt_valid", [True] * num_frames)
-            frame_valid = torch.as_tensor(frame_valid, dtype=torch.bool, device=self.device)
+            frame_valid = torch.as_tensor(
+                targets_per_video.get("gt_valid", [True] * num_frames),
+                dtype=torch.bool,
+                device=self.device,
+            )
             if frame_valid.numel() != num_frames:
                 raise ValueError(
                     f"gt_valid has {frame_valid.numel()} entries, expected {num_frames}"
                 )
 
+            source_pixel_valid = targets_per_video.get("pixel_valid_masks")
+            if source_pixel_valid is not None:
+                source_pixel_valid = torch.as_tensor(
+                    source_pixel_valid, dtype=torch.bool, device=self.device
+                )
+                if source_pixel_valid.shape[0] != num_frames:
+                    raise ValueError(
+                        "pixel_valid_masks must have one mask per sampled frame"
+                    )
+
+            label_exhaustive = torch.as_tensor(
+                targets_per_video.get("label_exhaustive", frame_valid.tolist()),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if label_exhaustive.numel() != num_frames:
+                raise ValueError(
+                    "label_exhaustive must have one entry per sampled frame"
+                )
+            label_exhaustive &= frame_valid
+
             _num_instance = len(targets_per_video["instances"][0])
             mask_shape = [_num_instance, num_frames, h_pad, w_pad]
             gt_masks_per_video = torch.zeros(mask_shape, dtype=torch.bool, device=self.device)
+            pixel_valid_per_video = torch.zeros(
+                (num_frames, h_pad, w_pad), dtype=torch.bool, device=self.device
+            )
             gt_classes_per_video = torch.full(
                 (_num_instance,), -1, dtype=torch.long, device=self.device
             )
@@ -377,10 +412,15 @@ class videomt(nn.Module):
 
                 frame_ids = targets_per_frame.gt_ids.clone()
                 if not frame_valid[f_i]:
-                    # Context-only frames participate in the temporal forward pass but
-                    # must not create targets, background labels, or mask loss.
+                    # Context-only frames still update temporal queries but contribute
+                    # neither foreground nor background supervision.
                     frame_ids.fill_(-1)
                 else:
+                    if source_pixel_valid is None:
+                        pixel_valid_per_video[f_i, :h, :w] = True
+                    else:
+                        pixel_valid_per_video[f_i, :h, :w] = source_pixel_valid[f_i, :h, :w]
+
                     visible = frame_ids != -1
                     if visible.any():
                         gt_classes_per_video[visible] = targets_per_frame.gt_classes[visible]
@@ -404,6 +444,8 @@ class videomt(nn.Module):
                     "ids": gt_ids_per_video,
                     "masks": gt_masks_per_video,
                     "frame_valid": frame_valid,
+                    "pixel_valid": pixel_valid_per_video,
+                    "label_exhaustive": label_exhaustive,
                 }
             )
 
@@ -1237,16 +1279,24 @@ class videomt_online(videomt):
                 ids = targets_per_video['ids'][:, [f]]
                 masks = targets_per_video['masks'][:, [f], :, :]
                 frame_valid = targets_per_video.get("frame_valid")
-                if frame_valid is None:
-                    is_supervised = True
-                else:
-                    is_supervised = bool(frame_valid[f].item())
+                is_supervised = True if frame_valid is None else bool(frame_valid[f].item())
+                pixel_valid = targets_per_video.get("pixel_valid")
+                if pixel_valid is not None:
+                    pixel_valid = pixel_valid[[f], :, :]
+                label_exhaustive = targets_per_video.get("label_exhaustive")
+                is_exhaustive = (
+                    is_supervised
+                    if label_exhaustive is None
+                    else bool(label_exhaustive[f].item())
+                )
                 gt_instances.append(
                     {
                         "labels": labels,
                         "ids": ids,
                         "masks": masks,
                         "frame_valid": is_supervised,
+                        "pixel_valid": pixel_valid,
+                        "label_exhaustive": is_exhaustive,
                     }
                 )
         return  outputs, gt_instances

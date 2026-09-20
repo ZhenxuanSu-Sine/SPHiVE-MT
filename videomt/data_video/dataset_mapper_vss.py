@@ -315,8 +315,13 @@ class SemanticDatasetVideoMapper:
         dataset_dict["pixel_valid_masks"] = torch.from_numpy(
             np.ascontiguousarray(pixel_valid_masks)
         ).bool()
+        effective_gt_valid = [
+            bool(select_gt_valid[i] and pixel_valid_masks[i].any())
+            for i in range(len(select_gt_valid))
+        ]
+        dataset_dict["gt_valid"] = effective_gt_valid
         dataset_dict["label_exhaustive"] = [
-            bool(select_gt_valid[i] and pixel_valid_masks[i].all())
+            bool(effective_gt_valid[i] and pixel_valid_masks[i].all())
             for i in range(len(select_gt_valid))
         ]
 

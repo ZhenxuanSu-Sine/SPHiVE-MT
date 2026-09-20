@@ -264,7 +264,19 @@ class videomt(nn.Module):
                 labels = targets_per_video['labels']
                 ids = targets_per_video['ids'][:, [f]]
                 masks = targets_per_video['masks'][:, [f], :, :]
-                gt_instances.append({"labels": labels, "ids": ids, "masks": masks})
+                frame_valid = targets_per_video.get("frame_valid")
+                if frame_valid is None:
+                    is_supervised = True
+                else:
+                    is_supervised = bool(frame_valid[f].item())
+                gt_instances.append(
+                    {
+                        "labels": labels,
+                        "ids": ids,
+                        "masks": masks,
+                        "frame_valid": is_supervised,
+                    }
+                )
         return outputs, gt_instances
 
     def match_from_embds(self, tgt_embds, cur_embds):
@@ -343,30 +355,57 @@ class videomt(nn.Module):
         h_pad, w_pad = images.tensor.shape[-2:]
         gt_instances = []
         for targets_per_video in targets:
+            num_frames = len(targets_per_video["instances"])
+            frame_valid = targets_per_video.get("gt_valid", [True] * num_frames)
+            frame_valid = torch.as_tensor(frame_valid, dtype=torch.bool, device=self.device)
+            if frame_valid.numel() != num_frames:
+                raise ValueError(
+                    f"gt_valid has {frame_valid.numel()} entries, expected {num_frames}"
+                )
+
             _num_instance = len(targets_per_video["instances"][0])
-            mask_shape = [_num_instance, self.num_frames, h_pad, w_pad]
+            mask_shape = [_num_instance, num_frames, h_pad, w_pad]
             gt_masks_per_video = torch.zeros(mask_shape, dtype=torch.bool, device=self.device)
+            gt_classes_per_video = torch.full(
+                (_num_instance,), -1, dtype=torch.long, device=self.device
+            )
 
             gt_ids_per_video = []
             for f_i, targets_per_frame in enumerate(targets_per_video["instances"]):
                 targets_per_frame = targets_per_frame.to(self.device)
                 h, w = targets_per_frame.image_size
 
-                gt_ids_per_video.append(targets_per_frame.gt_ids[:, None])
-                if isinstance(targets_per_frame.gt_masks, BitMasks):
-                    gt_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_masks.tensor
-                else:  # polygon
-                    gt_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_masks
+                frame_ids = targets_per_frame.gt_ids.clone()
+                if not frame_valid[f_i]:
+                    # Context-only frames participate in the temporal forward pass but
+                    # must not create targets, background labels, or mask loss.
+                    frame_ids.fill_(-1)
+                else:
+                    visible = frame_ids != -1
+                    if visible.any():
+                        gt_classes_per_video[visible] = targets_per_frame.gt_classes[visible]
+                    if isinstance(targets_per_frame.gt_masks, BitMasks):
+                        gt_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_masks.tensor
+                    else:  # polygon
+                        gt_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_masks
+
+                gt_ids_per_video.append(frame_ids[:, None])
 
             gt_ids_per_video = torch.cat(gt_ids_per_video, dim=1)
             valid_idx = (gt_ids_per_video != -1).any(dim=-1)
 
-            gt_classes_per_video = targets_per_frame.gt_classes[valid_idx]          # N,
-            gt_ids_per_video = gt_ids_per_video[valid_idx]                          # N, num_frames
+            gt_classes_per_video = gt_classes_per_video[valid_idx]
+            gt_ids_per_video = gt_ids_per_video[valid_idx]
+            gt_masks_per_video = gt_masks_per_video[valid_idx].float()
 
-            gt_instances.append({"labels": gt_classes_per_video, "ids": gt_ids_per_video})
-            gt_masks_per_video = gt_masks_per_video[valid_idx].float()          # N, num_frames, H, W
-            gt_instances[-1].update({"masks": gt_masks_per_video})
+            gt_instances.append(
+                {
+                    "labels": gt_classes_per_video,
+                    "ids": gt_ids_per_video,
+                    "masks": gt_masks_per_video,
+                    "frame_valid": frame_valid,
+                }
+            )
 
         return gt_instances
 
@@ -1197,7 +1236,19 @@ class videomt_online(videomt):
                 labels = targets_per_video['labels']
                 ids = targets_per_video['ids'][:, [f]]
                 masks = targets_per_video['masks'][:, [f], :, :]
-                gt_instances.append({"labels": labels, "ids": ids, "masks": masks})
+                frame_valid = targets_per_video.get("frame_valid")
+                if frame_valid is None:
+                    is_supervised = True
+                else:
+                    is_supervised = bool(frame_valid[f].item())
+                gt_instances.append(
+                    {
+                        "labels": labels,
+                        "ids": ids,
+                        "masks": masks,
+                        "frame_valid": is_supervised,
+                    }
+                )
         return  outputs, gt_instances
    
 

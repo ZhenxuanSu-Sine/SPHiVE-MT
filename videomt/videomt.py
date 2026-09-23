@@ -263,7 +263,8 @@ class videomt(nn.Module):
         for targets_per_video in targets:
             num_labeled_frames = targets_per_video['ids'].shape[1]
             for f in range(num_labeled_frames):
-                labels = targets_per_video['labels']
+                labels_all = targets_per_video['labels']
+                labels = labels_all[:, f] if labels_all.ndim == 2 else labels_all
                 ids = targets_per_video['ids'][:, [f]]
                 masks = targets_per_video['masks'][:, [f], :, :]
                 frame_valid = targets_per_video.get("frame_valid")
@@ -1253,7 +1254,10 @@ class videomt_online(videomt):
 
         if self.training:
 
-            targets = self.prepare_targets(batched_inputs, images)
+            if "sphive_targets" in batched_inputs[0]:
+                targets = self.prepare_sphive_targets(batched_inputs, images)
+            else:
+                targets = self.prepare_targets(batched_inputs, images)
             outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
             losses = self.criterion(outputs, targets)
 
@@ -1286,6 +1290,112 @@ class videomt_online(videomt):
                 mask_cls_result, mask_pred_result, image_size, height, width, first_resize_size, pred_id
             )
 
+    def prepare_sphive_targets(self, batched_inputs, images):
+        """Convert unified frame annotations to VidEoMT-aligned instance slots.
+
+        far=true annotations are kept only for semantic projection. far=false
+        annotations create instance slots; track_id>=0 keeps the slot stable
+        across frames.
+        """
+        h_pad, w_pad = images.tensor.shape[-2:]
+        videos = []
+
+        for video in batched_inputs:
+            frame_targets = video["sphive_targets"]
+            num_frames = len(frame_targets)
+
+            slot_by_key = {}
+            next_slot = 0
+            for f, target in enumerate(frame_targets):
+                if target is None:
+                    continue
+                instance_indices = torch.nonzero(~target["far"], as_tuple=False).flatten()
+                for local_idx in instance_indices.tolist():
+                    track_id = int(target["track_ids"][local_idx].item())
+                    key = ("track", track_id) if track_id >= 0 else ("frame", f, local_idx)
+                    if key not in slot_by_key:
+                        slot_by_key[key] = next_slot
+                        next_slot += 1
+
+            num_slots = next_slot
+            labels = torch.zeros(
+                (num_slots, num_frames), dtype=torch.long, device=self.device
+            )
+            ids = torch.full(
+                (num_slots, num_frames), -1, dtype=torch.long, device=self.device
+            )
+            masks = torch.zeros(
+                (num_slots, num_frames, h_pad, w_pad),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            frame_valid = torch.zeros(num_frames, dtype=torch.bool, device=self.device)
+            pixel_valid = torch.zeros(
+                (num_frames, h_pad, w_pad), dtype=torch.bool, device=self.device
+            )
+            region_node_ids = []
+            region_masks = []
+            exhaustive_node_ids = []
+
+            for f, target in enumerate(frame_targets):
+                if target is None:
+                    region_node_ids.append(
+                        torch.empty(0, dtype=torch.long, device=self.device)
+                    )
+                    region_masks.append(
+                        torch.zeros((0, 1, h_pad, w_pad), dtype=torch.float32, device=self.device)
+                    )
+                    exhaustive_node_ids.append(
+                        torch.empty(0, dtype=torch.long, device=self.device)
+                    )
+                    continue
+
+                frame_valid[f] = True
+                target_node_ids = target["node_ids"].to(self.device)
+                if self.taxonomy is not None and target_node_ids.numel() > 0:
+                    if target_node_ids.min() < 0 or target_node_ids.max() >= self.taxonomy.num_nodes:
+                        raise ValueError("SPHiVE node_id is outside the configured taxonomy")
+
+                h, w = target["valid_mask"].shape[-2:]
+                pixel_valid[f, :h, :w] = target["valid_mask"].to(self.device)
+
+                all_region_masks = torch.zeros(
+                    (len(target_node_ids), 1, h_pad, w_pad),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                if len(target_node_ids):
+                    all_region_masks[:, 0, :h, :w] = target["masks"].to(self.device).float()
+                region_node_ids.append(target_node_ids)
+                region_masks.append(all_region_masks)
+                exhaustive_node_ids.append(
+                    target["exhaustive_node_ids"].to(self.device)
+                )
+
+                instance_indices = torch.nonzero(~target["far"], as_tuple=False).flatten()
+                for local_idx in instance_indices.tolist():
+                    track_id = int(target["track_ids"][local_idx].item())
+                    key = ("track", track_id) if track_id >= 0 else ("frame", f, local_idx)
+                    slot = slot_by_key[key]
+                    labels[slot, f] = target_node_ids[local_idx]
+                    ids[slot, f] = slot
+                    masks[slot, f, :h, :w] = target["masks"][local_idx].to(self.device).float()
+
+            videos.append(
+                {
+                    "labels": labels,
+                    "ids": ids,
+                    "masks": masks,
+                    "frame_valid": frame_valid,
+                    "pixel_valid": pixel_valid,
+                    "region_node_ids": region_node_ids,
+                    "region_masks": region_masks,
+                    "exhaustive_node_ids": exhaustive_node_ids,
+                }
+            )
+
+        return videos
+
     def frame_decoder_loss_reshape(self, outputs, targets):
         outputs['pred_masks'] = einops.rearrange(outputs['pred_masks'], 'b q t h w -> (b t) q () h w')
         outputs['pred_logits'] = einops.rearrange(outputs['pred_logits'], 'b t q c -> (b t) q c')
@@ -1316,16 +1426,23 @@ class videomt_online(videomt):
                     if label_exhaustive is None
                     else bool(label_exhaustive[f].item())
                 )
-                gt_instances.append(
-                    {
-                        "labels": labels,
-                        "ids": ids,
-                        "masks": masks,
-                        "frame_valid": is_supervised,
-                        "pixel_valid": pixel_valid,
-                        "label_exhaustive": is_exhaustive,
-                    }
-                )
+                frame_target = {
+                    "labels": labels,
+                    "ids": ids,
+                    "masks": masks,
+                    "frame_valid": is_supervised,
+                    "pixel_valid": pixel_valid,
+                    "label_exhaustive": is_exhaustive,
+                }
+                if "region_node_ids" in targets_per_video:
+                    frame_target.update(
+                        {
+                            "region_node_ids": targets_per_video["region_node_ids"][f],
+                            "region_masks": targets_per_video["region_masks"][f],
+                            "exhaustive_node_ids": targets_per_video["exhaustive_node_ids"][f],
+                        }
+                    )
+                gt_instances.append(frame_target)
         return  outputs, gt_instances
    
 

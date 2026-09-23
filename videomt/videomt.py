@@ -33,6 +33,8 @@ from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from torchvision.transforms.v2.functional import resize, pad
 
 from .criterion_videomt import VideoSetCriterion, loss_reid
+from .criterion_sphive import SPHiVESetCriterion
+from .taxonomy import Taxonomy
 from .modeling.matcher import VideoHungarianMatcher, VideoHungarianMatcher_Consistent
 from .utils.memory import retry_if_cuda_oom
 
@@ -1022,6 +1024,7 @@ class videomt_online(videomt):
         max_iter_num,
         window_size,
         task,
+        taxonomy=None,
     ):
         """
         Args:
@@ -1076,11 +1079,13 @@ class videomt_online(videomt):
 
         self.window_size = window_size
         self.task = task
-        assert self.task in ['vis', 'vss', 'vps'], "Only support vis, vss and vps !"
+        self.taxonomy = taxonomy
+        assert self.task in ['vis', 'vss', 'vps', 'sphive'], "Unsupported segmentation task"
         inference_dict = {
             'vis': self.inference_video_vis,
             'vss': self.inference_video_vss,
             'vps': self.inference_video_vps,
+            'sphive': self.inference_video_sphive,
         }
         self.inference_video_task = inference_dict[self.task]
 
@@ -1089,23 +1094,35 @@ class videomt_online(videomt):
     def from_config(cls, cfg):
         backbone = build_backbone(cfg)
 
-
-        # Loss parameters:
         deep_supervision = cfg.MODEL.BACKBONE.DEEP_SUPERVISION
         no_object_weight = cfg.MODEL.BACKBONE.NO_OBJECT_WEIGHT
-
-        # loss weights
         class_weight = cfg.MODEL.BACKBONE.CLASS_WEIGHT
         dice_weight = cfg.MODEL.BACKBONE.DICE_WEIGHT
         mask_weight = cfg.MODEL.BACKBONE.MASK_WEIGHT
 
-        # building criterion
+        use_sphive = (
+            cfg.MODEL.BACKBONE.TEST.TASK == "sphive"
+            or "sphive" in list(cfg.DATASETS.DATASET_TYPE)
+        )
+        taxonomy = None
+        descendant_matrix = None
+        if use_sphive:
+            if not cfg.DATASETS.TAXONOMY_FILE:
+                raise ValueError("DATASETS.TAXONOMY_FILE is required for SPHiVE training/inference")
+            taxonomy = Taxonomy.from_json(cfg.DATASETS.TAXONOMY_FILE)
+            if backbone.num_classes != taxonomy.num_nodes:
+                raise ValueError(
+                    f"MODEL classes ({backbone.num_classes}) != taxonomy nodes ({taxonomy.num_nodes})"
+                )
+            descendant_matrix = taxonomy.descendant_matrix
+
         matcher = VideoHungarianMatcher_Consistent(
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.BACKBONE.TRAIN_NUM_POINTS,
-            frames=cfg.INPUT.SAMPLING_FRAME_NUM
+            frames=cfg.INPUT.SAMPLING_FRAME_NUM,
+            descendant_matrix=descendant_matrix,
         )
 
         weight_dict = {
@@ -1114,38 +1131,48 @@ class videomt_online(videomt):
             "loss_dice": dice_weight,
         }
 
-
         if deep_supervision:
             dec_layers = len(cfg.MODEL.BACKBONE.SEGMENTER_BLOCKS)
             aux_weight_dict = {}
             for i in range(dec_layers - 1):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
-          
 
-        weight_dict.update(
-            {
-                "loss_reid": 2.0,
-                "loss_reid_aux": 2.0,
-            }
-        )
-
-        losses = ["labels", "masks"]
-
-        criterion = VideoSetCriterion(
-            backbone.num_classes,
-            matcher=matcher,
-            weight_dict=weight_dict,
-            eos_coef=no_object_weight,
-            losses=losses,
-            num_points=cfg.MODEL.BACKBONE.TRAIN_NUM_POINTS,
-            oversample_ratio=cfg.MODEL.BACKBONE.OVERSAMPLE_RATIO,
-            importance_sample_ratio=cfg.MODEL.BACKBONE.IMPORTANCE_SAMPLE_RATIO,
-        )
-
-    
-
-        max_iter_num = cfg.SOLVER.MAX_ITER
+        if use_sphive:
+            weight_dict.update(
+                {
+                    "loss_semantic_mask": cfg.MODEL.BACKBONE.SEMANTIC_MASK_WEIGHT,
+                    "loss_semantic_dice": cfg.MODEL.BACKBONE.SEMANTIC_DICE_WEIGHT,
+                }
+            )
+            criterion = SPHiVESetCriterion(
+                backbone.num_classes,
+                matcher=matcher,
+                weight_dict=weight_dict,
+                eos_coef=no_object_weight,
+                losses=["labels", "masks"],
+                num_points=cfg.MODEL.BACKBONE.TRAIN_NUM_POINTS,
+                oversample_ratio=cfg.MODEL.BACKBONE.OVERSAMPLE_RATIO,
+                importance_sample_ratio=cfg.MODEL.BACKBONE.IMPORTANCE_SAMPLE_RATIO,
+                descendant_matrix=descendant_matrix,
+            )
+        else:
+            weight_dict.update(
+                {
+                    "loss_reid": 2.0,
+                    "loss_reid_aux": 2.0,
+                }
+            )
+            criterion = VideoSetCriterion(
+                backbone.num_classes,
+                matcher=matcher,
+                weight_dict=weight_dict,
+                eos_coef=no_object_weight,
+                losses=["labels", "masks"],
+                num_points=cfg.MODEL.BACKBONE.TRAIN_NUM_POINTS,
+                oversample_ratio=cfg.MODEL.BACKBONE.OVERSAMPLE_RATIO,
+                importance_sample_ratio=cfg.MODEL.BACKBONE.IMPORTANCE_SAMPLE_RATIO,
+            )
 
         return {
             "backbone": backbone,
@@ -1159,13 +1186,13 @@ class videomt_online(videomt):
             "sem_seg_postprocess_before_inference": True,
             "pixel_mean": cfg.MODEL.PIXEL_MEAN,
             "pixel_std": cfg.MODEL.PIXEL_STD,
-            # video
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
             "window_inference": cfg.MODEL.BACKBONE.TEST.WINDOW_INFERENCE,
             "max_num": cfg.MODEL.BACKBONE.TEST.MAX_NUM,
-            "max_iter_num": max_iter_num,
+            "max_iter_num": cfg.SOLVER.MAX_ITER,
             "window_size": cfg.MODEL.BACKBONE.TEST.WINDOW_SIZE,
             "task": cfg.MODEL.BACKBONE.TEST.TASK,
+            "taxonomy": taxonomy,
         }
 
     def forward(self, batched_inputs):

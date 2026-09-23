@@ -43,6 +43,8 @@ def add_videomt_config(cfg):
     cfg.MODEL.BACKBONE.CLASS_WEIGHT = 1.0
     cfg.MODEL.BACKBONE.DICE_WEIGHT = 1.0
     cfg.MODEL.BACKBONE.MASK_WEIGHT = 20.0
+    cfg.MODEL.BACKBONE.SEMANTIC_MASK_WEIGHT = 1.0
+    cfg.MODEL.BACKBONE.SEMANTIC_DICE_WEIGHT = 1.0
     cfg.MODEL.BACKBONE.NAME = "VidEoMT"
 
     # transformer config
@@ -106,6 +108,8 @@ def add_videomt_config(cfg):
     cfg.DATASETS.DATASET_NEED_MAP = [False]
     cfg.DATASETS.DATASET_TYPE = ['video_instance']
     cfg.DATASETS.DATASET_TYPE_TEST = ['video_instance']
+    # SPHiVE unified dataset/taxonomy. A sphive dataset name may be a JSONL manifest path.
+    cfg.DATASETS.TAXONOMY_FILE = ""
 
     # Pseudo data augmentation
     cfg.INPUT.PSEUDO = CN()

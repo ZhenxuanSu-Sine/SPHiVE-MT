@@ -4,6 +4,7 @@
 from .dataset_mapper import YTVISDatasetMapper, CocoClipDatasetMapper
 from .dataset_mapper_vps import PanopticDatasetVideoMapper
 from .dataset_mapper_vss import SemanticDatasetVideoMapper
+from .dataset_mapper_sphive import SPHiVEDatasetMapper, load_sphive_manifest
 from .build import *
 
 from .datasets import *

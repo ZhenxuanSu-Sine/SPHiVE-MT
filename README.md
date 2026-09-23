@@ -56,7 +56,9 @@ wandb login
 
 ## Data preparation
 
-[Download and prepare the datasets.](datasets/README.md)  
+- [SPHiVE dataset format](docs/dataset_format.md)
+- [Supervision rules](docs/supervision_contract.md)
+- [Original VidEoMT dataset preparation](datasets/README.md)
 
 
 ## Usage

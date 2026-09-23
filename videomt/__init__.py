@@ -20,6 +20,8 @@ from .data_video import (
     YTVISEvaluator,
     PanopticDatasetVideoMapper,
     SemanticDatasetVideoMapper,
+    SPHiVEDatasetMapper,
+    load_sphive_manifest,
     VPSEvaluator,
     VSSEvaluator,
     build_combined_loader,

@@ -33,6 +33,8 @@ from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from torchvision.transforms.v2.functional import resize, pad
 
 from .criterion_videomt import VideoSetCriterion, loss_reid
+from .criterion_sphive import SPHiVESetCriterion
+from .taxonomy import Taxonomy
 from .modeling.matcher import VideoHungarianMatcher, VideoHungarianMatcher_Consistent
 from .utils.memory import retry_if_cuda_oom
 
@@ -261,10 +263,31 @@ class videomt(nn.Module):
         for targets_per_video in targets:
             num_labeled_frames = targets_per_video['ids'].shape[1]
             for f in range(num_labeled_frames):
-                labels = targets_per_video['labels']
+                labels_all = targets_per_video['labels']
+                labels = labels_all[:, f] if labels_all.ndim == 2 else labels_all
                 ids = targets_per_video['ids'][:, [f]]
                 masks = targets_per_video['masks'][:, [f], :, :]
-                gt_instances.append({"labels": labels, "ids": ids, "masks": masks})
+                frame_valid = targets_per_video.get("frame_valid")
+                is_supervised = True if frame_valid is None else bool(frame_valid[f].item())
+                pixel_valid = targets_per_video.get("pixel_valid")
+                if pixel_valid is not None:
+                    pixel_valid = pixel_valid[[f], :, :]
+                label_exhaustive = targets_per_video.get("label_exhaustive")
+                is_exhaustive = (
+                    is_supervised
+                    if label_exhaustive is None
+                    else bool(label_exhaustive[f].item())
+                )
+                gt_instances.append(
+                    {
+                        "labels": labels,
+                        "ids": ids,
+                        "masks": masks,
+                        "frame_valid": is_supervised,
+                        "pixel_valid": pixel_valid,
+                        "label_exhaustive": is_exhaustive,
+                    }
+                )
         return outputs, gt_instances
 
     def match_from_embds(self, tgt_embds, cur_embds):
@@ -343,30 +366,91 @@ class videomt(nn.Module):
         h_pad, w_pad = images.tensor.shape[-2:]
         gt_instances = []
         for targets_per_video in targets:
+            num_frames = len(targets_per_video["instances"])
+            frame_valid = torch.as_tensor(
+                targets_per_video.get("gt_valid", [True] * num_frames),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if frame_valid.numel() != num_frames:
+                raise ValueError(
+                    f"gt_valid has {frame_valid.numel()} entries, expected {num_frames}"
+                )
+
+            source_pixel_valid = targets_per_video.get("pixel_valid_masks")
+            if source_pixel_valid is not None:
+                source_pixel_valid = torch.as_tensor(
+                    source_pixel_valid, dtype=torch.bool, device=self.device
+                )
+                if source_pixel_valid.shape[0] != num_frames:
+                    raise ValueError(
+                        "pixel_valid_masks must have one mask per sampled frame"
+                    )
+
+            label_exhaustive = torch.as_tensor(
+                targets_per_video.get("label_exhaustive", frame_valid.tolist()),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if label_exhaustive.numel() != num_frames:
+                raise ValueError(
+                    "label_exhaustive must have one entry per sampled frame"
+                )
+            label_exhaustive &= frame_valid
+
             _num_instance = len(targets_per_video["instances"][0])
-            mask_shape = [_num_instance, self.num_frames, h_pad, w_pad]
+            mask_shape = [_num_instance, num_frames, h_pad, w_pad]
             gt_masks_per_video = torch.zeros(mask_shape, dtype=torch.bool, device=self.device)
+            pixel_valid_per_video = torch.zeros(
+                (num_frames, h_pad, w_pad), dtype=torch.bool, device=self.device
+            )
+            gt_classes_per_video = torch.full(
+                (_num_instance,), -1, dtype=torch.long, device=self.device
+            )
 
             gt_ids_per_video = []
             for f_i, targets_per_frame in enumerate(targets_per_video["instances"]):
                 targets_per_frame = targets_per_frame.to(self.device)
                 h, w = targets_per_frame.image_size
 
-                gt_ids_per_video.append(targets_per_frame.gt_ids[:, None])
-                if isinstance(targets_per_frame.gt_masks, BitMasks):
-                    gt_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_masks.tensor
-                else:  # polygon
-                    gt_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_masks
+                frame_ids = targets_per_frame.gt_ids.clone()
+                if not frame_valid[f_i]:
+                    # Context-only frames still update temporal queries but contribute
+                    # neither foreground nor background supervision.
+                    frame_ids.fill_(-1)
+                else:
+                    if source_pixel_valid is None:
+                        pixel_valid_per_video[f_i, :h, :w] = True
+                    else:
+                        pixel_valid_per_video[f_i, :h, :w] = source_pixel_valid[f_i, :h, :w]
+
+                    visible = frame_ids != -1
+                    if visible.any():
+                        gt_classes_per_video[visible] = targets_per_frame.gt_classes[visible]
+                    if isinstance(targets_per_frame.gt_masks, BitMasks):
+                        gt_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_masks.tensor
+                    else:  # polygon
+                        gt_masks_per_video[:, f_i, :h, :w] = targets_per_frame.gt_masks
+
+                gt_ids_per_video.append(frame_ids[:, None])
 
             gt_ids_per_video = torch.cat(gt_ids_per_video, dim=1)
             valid_idx = (gt_ids_per_video != -1).any(dim=-1)
 
-            gt_classes_per_video = targets_per_frame.gt_classes[valid_idx]          # N,
-            gt_ids_per_video = gt_ids_per_video[valid_idx]                          # N, num_frames
+            gt_classes_per_video = gt_classes_per_video[valid_idx]
+            gt_ids_per_video = gt_ids_per_video[valid_idx]
+            gt_masks_per_video = gt_masks_per_video[valid_idx].float()
 
-            gt_instances.append({"labels": gt_classes_per_video, "ids": gt_ids_per_video})
-            gt_masks_per_video = gt_masks_per_video[valid_idx].float()          # N, num_frames, H, W
-            gt_instances[-1].update({"masks": gt_masks_per_video})
+            gt_instances.append(
+                {
+                    "labels": gt_classes_per_video,
+                    "ids": gt_ids_per_video,
+                    "masks": gt_masks_per_video,
+                    "frame_valid": frame_valid,
+                    "pixel_valid": pixel_valid_per_video,
+                    "label_exhaustive": label_exhaustive,
+                }
+            )
 
         return gt_instances
 
@@ -941,6 +1025,7 @@ class videomt_online(videomt):
         max_iter_num,
         window_size,
         task,
+        taxonomy=None,
     ):
         """
         Args:
@@ -995,11 +1080,13 @@ class videomt_online(videomt):
 
         self.window_size = window_size
         self.task = task
-        assert self.task in ['vis', 'vss', 'vps'], "Only support vis, vss and vps !"
+        self.taxonomy = taxonomy
+        assert self.task in ['vis', 'vss', 'vps', 'sphive'], "Unsupported segmentation task"
         inference_dict = {
             'vis': self.inference_video_vis,
             'vss': self.inference_video_vss,
             'vps': self.inference_video_vps,
+            'sphive': self.inference_video_sphive,
         }
         self.inference_video_task = inference_dict[self.task]
 
@@ -1008,23 +1095,35 @@ class videomt_online(videomt):
     def from_config(cls, cfg):
         backbone = build_backbone(cfg)
 
-
-        # Loss parameters:
         deep_supervision = cfg.MODEL.BACKBONE.DEEP_SUPERVISION
         no_object_weight = cfg.MODEL.BACKBONE.NO_OBJECT_WEIGHT
-
-        # loss weights
         class_weight = cfg.MODEL.BACKBONE.CLASS_WEIGHT
         dice_weight = cfg.MODEL.BACKBONE.DICE_WEIGHT
         mask_weight = cfg.MODEL.BACKBONE.MASK_WEIGHT
 
-        # building criterion
+        use_sphive = (
+            cfg.MODEL.BACKBONE.TEST.TASK == "sphive"
+            or "sphive" in list(cfg.DATASETS.DATASET_TYPE)
+        )
+        taxonomy = None
+        descendant_matrix = None
+        if use_sphive:
+            if not cfg.DATASETS.TAXONOMY_FILE:
+                raise ValueError("DATASETS.TAXONOMY_FILE is required for SPHiVE training/inference")
+            taxonomy = Taxonomy.from_json(cfg.DATASETS.TAXONOMY_FILE)
+            if backbone.num_classes != taxonomy.num_nodes:
+                raise ValueError(
+                    f"MODEL classes ({backbone.num_classes}) != taxonomy nodes ({taxonomy.num_nodes})"
+                )
+            descendant_matrix = taxonomy.descendant_matrix
+
         matcher = VideoHungarianMatcher_Consistent(
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.BACKBONE.TRAIN_NUM_POINTS,
-            frames=cfg.INPUT.SAMPLING_FRAME_NUM
+            frames=cfg.INPUT.SAMPLING_FRAME_NUM,
+            descendant_matrix=descendant_matrix,
         )
 
         weight_dict = {
@@ -1033,38 +1132,48 @@ class videomt_online(videomt):
             "loss_dice": dice_weight,
         }
 
-
         if deep_supervision:
             dec_layers = len(cfg.MODEL.BACKBONE.SEGMENTER_BLOCKS)
             aux_weight_dict = {}
             for i in range(dec_layers - 1):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
-          
 
-        weight_dict.update(
-            {
-                "loss_reid": 2.0,
-                "loss_reid_aux": 2.0,
-            }
-        )
-
-        losses = ["labels", "masks"]
-
-        criterion = VideoSetCriterion(
-            backbone.num_classes,
-            matcher=matcher,
-            weight_dict=weight_dict,
-            eos_coef=no_object_weight,
-            losses=losses,
-            num_points=cfg.MODEL.BACKBONE.TRAIN_NUM_POINTS,
-            oversample_ratio=cfg.MODEL.BACKBONE.OVERSAMPLE_RATIO,
-            importance_sample_ratio=cfg.MODEL.BACKBONE.IMPORTANCE_SAMPLE_RATIO,
-        )
-
-    
-
-        max_iter_num = cfg.SOLVER.MAX_ITER
+        if use_sphive:
+            weight_dict.update(
+                {
+                    "loss_semantic_mask": cfg.MODEL.BACKBONE.SEMANTIC_MASK_WEIGHT,
+                    "loss_semantic_dice": cfg.MODEL.BACKBONE.SEMANTIC_DICE_WEIGHT,
+                }
+            )
+            criterion = SPHiVESetCriterion(
+                backbone.num_classes,
+                matcher=matcher,
+                weight_dict=weight_dict,
+                eos_coef=no_object_weight,
+                losses=["labels", "masks"],
+                num_points=cfg.MODEL.BACKBONE.TRAIN_NUM_POINTS,
+                oversample_ratio=cfg.MODEL.BACKBONE.OVERSAMPLE_RATIO,
+                importance_sample_ratio=cfg.MODEL.BACKBONE.IMPORTANCE_SAMPLE_RATIO,
+                descendant_matrix=descendant_matrix,
+            )
+        else:
+            weight_dict.update(
+                {
+                    "loss_reid": 2.0,
+                    "loss_reid_aux": 2.0,
+                }
+            )
+            criterion = VideoSetCriterion(
+                backbone.num_classes,
+                matcher=matcher,
+                weight_dict=weight_dict,
+                eos_coef=no_object_weight,
+                losses=["labels", "masks"],
+                num_points=cfg.MODEL.BACKBONE.TRAIN_NUM_POINTS,
+                oversample_ratio=cfg.MODEL.BACKBONE.OVERSAMPLE_RATIO,
+                importance_sample_ratio=cfg.MODEL.BACKBONE.IMPORTANCE_SAMPLE_RATIO,
+            )
 
         return {
             "backbone": backbone,
@@ -1078,13 +1187,13 @@ class videomt_online(videomt):
             "sem_seg_postprocess_before_inference": True,
             "pixel_mean": cfg.MODEL.PIXEL_MEAN,
             "pixel_std": cfg.MODEL.PIXEL_STD,
-            # video
             "num_frames": cfg.INPUT.SAMPLING_FRAME_NUM,
             "window_inference": cfg.MODEL.BACKBONE.TEST.WINDOW_INFERENCE,
             "max_num": cfg.MODEL.BACKBONE.TEST.MAX_NUM,
-            "max_iter_num": max_iter_num,
+            "max_iter_num": cfg.SOLVER.MAX_ITER,
             "window_size": cfg.MODEL.BACKBONE.TEST.WINDOW_SIZE,
             "task": cfg.MODEL.BACKBONE.TEST.TASK,
+            "taxonomy": taxonomy,
         }
 
     def forward(self, batched_inputs):
@@ -1145,7 +1254,10 @@ class videomt_online(videomt):
 
         if self.training:
 
-            targets = self.prepare_targets(batched_inputs, images)
+            if "sphive_targets" in batched_inputs[0]:
+                targets = self.prepare_sphive_targets(batched_inputs, images)
+            else:
+                targets = self.prepare_targets(batched_inputs, images)
             outputs, targets = self.frame_decoder_loss_reshape(outputs, targets)
             losses = self.criterion(outputs, targets)
 
@@ -1178,6 +1290,112 @@ class videomt_online(videomt):
                 mask_cls_result, mask_pred_result, image_size, height, width, first_resize_size, pred_id
             )
 
+    def prepare_sphive_targets(self, batched_inputs, images):
+        """Convert unified frame annotations to VidEoMT-aligned instance slots.
+
+        far=true annotations are kept only for semantic projection. far=false
+        annotations create instance slots; track_id>=0 keeps the slot stable
+        across frames.
+        """
+        h_pad, w_pad = images.tensor.shape[-2:]
+        videos = []
+
+        for video in batched_inputs:
+            frame_targets = video["sphive_targets"]
+            num_frames = len(frame_targets)
+
+            slot_by_key = {}
+            next_slot = 0
+            for f, target in enumerate(frame_targets):
+                if target is None:
+                    continue
+                instance_indices = torch.nonzero(~target["far"], as_tuple=False).flatten()
+                for local_idx in instance_indices.tolist():
+                    track_id = int(target["track_ids"][local_idx].item())
+                    key = ("track", track_id) if track_id >= 0 else ("frame", f, local_idx)
+                    if key not in slot_by_key:
+                        slot_by_key[key] = next_slot
+                        next_slot += 1
+
+            num_slots = next_slot
+            labels = torch.zeros(
+                (num_slots, num_frames), dtype=torch.long, device=self.device
+            )
+            ids = torch.full(
+                (num_slots, num_frames), -1, dtype=torch.long, device=self.device
+            )
+            masks = torch.zeros(
+                (num_slots, num_frames, h_pad, w_pad),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            frame_valid = torch.zeros(num_frames, dtype=torch.bool, device=self.device)
+            pixel_valid = torch.zeros(
+                (num_frames, h_pad, w_pad), dtype=torch.bool, device=self.device
+            )
+            region_node_ids = []
+            region_masks = []
+            exhaustive_node_ids = []
+
+            for f, target in enumerate(frame_targets):
+                if target is None:
+                    region_node_ids.append(
+                        torch.empty(0, dtype=torch.long, device=self.device)
+                    )
+                    region_masks.append(
+                        torch.zeros((0, 1, h_pad, w_pad), dtype=torch.float32, device=self.device)
+                    )
+                    exhaustive_node_ids.append(
+                        torch.empty(0, dtype=torch.long, device=self.device)
+                    )
+                    continue
+
+                frame_valid[f] = True
+                target_node_ids = target["node_ids"].to(self.device)
+                if self.taxonomy is not None and target_node_ids.numel() > 0:
+                    if target_node_ids.min() < 0 or target_node_ids.max() >= self.taxonomy.num_nodes:
+                        raise ValueError("SPHiVE node_id is outside the configured taxonomy")
+
+                h, w = target["valid_mask"].shape[-2:]
+                pixel_valid[f, :h, :w] = target["valid_mask"].to(self.device)
+
+                all_region_masks = torch.zeros(
+                    (len(target_node_ids), 1, h_pad, w_pad),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                if len(target_node_ids):
+                    all_region_masks[:, 0, :h, :w] = target["masks"].to(self.device).float()
+                region_node_ids.append(target_node_ids)
+                region_masks.append(all_region_masks)
+                exhaustive_node_ids.append(
+                    target["exhaustive_node_ids"].to(self.device)
+                )
+
+                instance_indices = torch.nonzero(~target["far"], as_tuple=False).flatten()
+                for local_idx in instance_indices.tolist():
+                    track_id = int(target["track_ids"][local_idx].item())
+                    key = ("track", track_id) if track_id >= 0 else ("frame", f, local_idx)
+                    slot = slot_by_key[key]
+                    labels[slot, f] = target_node_ids[local_idx]
+                    ids[slot, f] = slot
+                    masks[slot, f, :h, :w] = target["masks"][local_idx].to(self.device).float()
+
+            videos.append(
+                {
+                    "labels": labels,
+                    "ids": ids,
+                    "masks": masks,
+                    "frame_valid": frame_valid,
+                    "pixel_valid": pixel_valid,
+                    "region_node_ids": region_node_ids,
+                    "region_masks": region_masks,
+                    "exhaustive_node_ids": exhaustive_node_ids,
+                }
+            )
+
+        return videos
+
     def frame_decoder_loss_reshape(self, outputs, targets):
         outputs['pred_masks'] = einops.rearrange(outputs['pred_masks'], 'b q t h w -> (b t) q () h w')
         outputs['pred_logits'] = einops.rearrange(outputs['pred_logits'], 'b t q c -> (b t) q c')
@@ -1194,10 +1412,38 @@ class videomt_online(videomt):
         for targets_per_video in targets:
             num_labeled_frames = targets_per_video['ids'].shape[1]
             for f in range(num_labeled_frames):
-                labels = targets_per_video['labels']
+                labels_all = targets_per_video['labels']
+                labels = labels_all[:, f] if labels_all.ndim == 2 else labels_all
                 ids = targets_per_video['ids'][:, [f]]
                 masks = targets_per_video['masks'][:, [f], :, :]
-                gt_instances.append({"labels": labels, "ids": ids, "masks": masks})
+                frame_valid = targets_per_video.get("frame_valid")
+                is_supervised = True if frame_valid is None else bool(frame_valid[f].item())
+                pixel_valid = targets_per_video.get("pixel_valid")
+                if pixel_valid is not None:
+                    pixel_valid = pixel_valid[[f], :, :]
+                label_exhaustive = targets_per_video.get("label_exhaustive")
+                is_exhaustive = (
+                    is_supervised
+                    if label_exhaustive is None
+                    else bool(label_exhaustive[f].item())
+                )
+                frame_target = {
+                    "labels": labels,
+                    "ids": ids,
+                    "masks": masks,
+                    "frame_valid": is_supervised,
+                    "pixel_valid": pixel_valid,
+                    "label_exhaustive": is_exhaustive,
+                }
+                if "region_node_ids" in targets_per_video:
+                    frame_target.update(
+                        {
+                            "region_node_ids": targets_per_video["region_node_ids"][f],
+                            "region_masks": targets_per_video["region_masks"][f],
+                            "exhaustive_node_ids": targets_per_video["exhaustive_node_ids"][f],
+                        }
+                    )
+                gt_instances.append(frame_target)
         return  outputs, gt_instances
    
 
@@ -1383,6 +1629,59 @@ class videomt_online(videomt):
                 "pred_ids": out_ids,
                 "task": "vps",
             }
+
+    def inference_video_sphive(
+        self, pred_cls, pred_masks, img_size, output_height, output_width,
+        first_resize_size, pred_id, aux_pred_cls=None,
+    ):
+        """Minimal unified inference.
+
+        Returns query-level instance candidates and overlapping semantic score
+        maps for every taxonomy node. Panoptic conflict resolution is left to a
+        later post-processing stage.
+        """
+        if self.taxonomy is None:
+            raise ValueError("SPHiVE inference requires a taxonomy")
+
+        class_probs = F.softmax(pred_cls, dim=-1)[:, :-1]
+        cur_masks = F.interpolate(
+            pred_masks, size=first_resize_size, mode="bilinear", align_corners=False
+        )
+        cur_masks = cur_masks[:, :, : img_size[0], : img_size[1]].sigmoid()
+        cur_masks = F.interpolate(
+            cur_masks,
+            size=(output_height, output_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        query_scores, query_labels = class_probs.max(-1)
+        keep = query_scores > self.object_mask_threshold
+        kept_masks = cur_masks[keep]
+        kept_ids = pred_id[keep]
+        kept_scores = query_scores[keep]
+        kept_labels = query_labels[keep]
+
+        descendants = self.taxonomy.descendant_matrix.to(class_probs.device)
+        semantic_scores = []
+        for node in range(self.taxonomy.num_nodes):
+            subtree_prob = class_probs[:, descendants[node]].sum(-1)
+            contribution = subtree_prob[:, None, None, None] * cur_masks
+            semantic = 1.0 - torch.prod(
+                1.0 - contribution.clamp(0.0, 1.0 - 1e-6), dim=0
+            )
+            semantic_scores.append(semantic)
+        semantic_scores = torch.stack(semantic_scores, dim=0)
+
+        return {
+            "image_size": (output_height, output_width),
+            "query_scores": kept_scores.cpu(),
+            "query_labels": kept_labels.cpu(),
+            "query_masks": (kept_masks > 0.5).cpu(),
+            "query_ids": kept_ids.cpu(),
+            "semantic_scores": semantic_scores.cpu(),
+            "task": "sphive",
+        }
 
     def inference_video_vss(
         self, pred_cls, pred_masks, img_size, output_height, output_width,

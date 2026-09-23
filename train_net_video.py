@@ -48,6 +48,8 @@ from videomt import (
     CocoClipDatasetMapper,
     PanopticDatasetVideoMapper,
     SemanticDatasetVideoMapper,
+    SPHiVEDatasetMapper,
+    load_sphive_manifest,
     YTVISEvaluator,
     VPSEvaluator,
     VSSEvaluator,
@@ -81,8 +83,12 @@ class Trainer(DefaultTrainer):
             os.makedirs(output_folder, exist_ok=True)
 
         evaluator_dict = {'vis': YTVISEvaluator, 'vss': VSSEvaluator, 'vps': VPSEvaluator}
-        assert cfg.MODEL.BACKBONE.TEST.TASK in evaluator_dict.keys()
-        return evaluator_dict[cfg.MODEL.BACKBONE.TEST.TASK](dataset_name, cfg, True, output_folder)
+        task = cfg.MODEL.BACKBONE.TEST.TASK
+        if task == 'sphive':
+            raise NotImplementedError("SPHiVE evaluator is not defined yet; use tools/infer_sphive.py")
+        if task not in evaluator_dict:
+            raise NotImplementedError(f"Unsupported evaluation task: {task}")
+        return evaluator_dict[task](dataset_name, cfg, True, output_folder)
 
     @classmethod
     def build_train_loader(cls, cfg):
@@ -94,25 +100,47 @@ class Trainer(DefaultTrainer):
             'video_panoptic': PanopticDatasetVideoMapper,
             'video_semantic': SemanticDatasetVideoMapper,
             'image_instance': CocoClipDatasetMapper,
+            'sphive': SPHiVEDatasetMapper,
         }
         for d_i, (dataset_name, dataset_type, dataset_need_map) in \
                 enumerate(zip(cfg.DATASETS.TRAIN, cfg.DATASETS.DATASET_TYPE, cfg.DATASETS.DATASET_NEED_MAP)):
             if dataset_type not in mapper_dict.keys():
                 raise NotImplementedError
             _mapper = mapper_dict[dataset_type]
-            mappers.append(
-                _mapper(cfg, is_train=True, is_tgt=not dataset_need_map, src_dataset_name=dataset_name, )
-            )
+            if dataset_type == 'sphive':
+                mappers.append(_mapper(cfg, is_train=True))
+            else:
+                mappers.append(
+                    _mapper(cfg, is_train=True, is_tgt=not dataset_need_map, src_dataset_name=dataset_name, )
+                )
         assert len(mappers) > 0, "No dataset is chosen!"
 
         if len(mappers) == 1:
             mapper = mappers[0]
+            dataset_type = cfg.DATASETS.DATASET_TYPE[0]
+            if dataset_type == 'sphive':
+                dataset = load_sphive_manifest(cfg.DATASETS.TRAIN[0])
+                return build_detection_train_loader(cfg, mapper=mapper, dataset=dataset)
             return build_detection_train_loader(cfg, mapper=mapper, dataset_name=cfg.DATASETS.TRAIN[0])
         else:
-            loaders = [
-                build_detection_train_loader(cfg, mapper=mapper, dataset_name=dataset_name)
-                for mapper, dataset_name in zip(mappers, cfg.DATASETS.TRAIN)
-            ]
+            loaders = []
+            for mapper, dataset_name, dataset_type in zip(
+                mappers, cfg.DATASETS.TRAIN, cfg.DATASETS.DATASET_TYPE
+            ):
+                if dataset_type == 'sphive':
+                    loaders.append(
+                        build_detection_train_loader(
+                            cfg,
+                            mapper=mapper,
+                            dataset=load_sphive_manifest(dataset_name),
+                        )
+                    )
+                else:
+                    loaders.append(
+                        build_detection_train_loader(
+                            cfg, mapper=mapper, dataset_name=dataset_name
+                        )
+                    )
             combined_data_loader = build_combined_loader(cfg, loaders, cfg.DATASETS.DATASET_RATIO)
             return combined_data_loader
 
@@ -122,10 +150,17 @@ class Trainer(DefaultTrainer):
             'video_instance': YTVISDatasetMapper,
             'video_panoptic': PanopticDatasetVideoMapper,
             'video_semantic': SemanticDatasetVideoMapper,
+            'sphive': SPHiVEDatasetMapper,
         }
         if dataset_type not in mapper_dict.keys():
             raise NotImplementedError
         mapper = mapper_dict[dataset_type](cfg, is_train=False)
+        if dataset_type == 'sphive':
+            return build_detection_test_loader(
+                dataset=load_sphive_manifest(dataset_name),
+                mapper=mapper,
+                num_workers=cfg.DATALOADER.NUM_WORKERS,
+            )
         return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
 
     @classmethod

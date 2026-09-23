@@ -44,6 +44,23 @@ dice_loss_jit = torch.jit.script(
 )  # type: torch.jit.ScriptModule
 
 
+def masked_dice_loss(
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        valid: torch.Tensor,
+        num_masks: float,
+    ):
+    """Dice loss with unknown/ignore pixels removed from both terms."""
+    inputs = inputs.sigmoid()
+    valid = valid.to(inputs)
+    numerator = 2 * (inputs * targets * valid).sum(-1)
+    denominator = (inputs * valid).sum(-1) + (targets * valid).sum(-1)
+    per_mask = 1 - (numerator + 1) / (denominator + 1)
+    has_valid = valid.sum(-1) > 0
+    per_mask = per_mask * has_valid.to(per_mask)
+    return per_mask.sum() / num_masks
+
+
 def sigmoid_ce_loss(
         inputs: torch.Tensor,
         targets: torch.Tensor,
@@ -67,6 +84,22 @@ def sigmoid_ce_loss(
 sigmoid_ce_loss_jit = torch.jit.script(
     sigmoid_ce_loss
 )  # type: torch.jit.ScriptModule
+
+
+def masked_sigmoid_ce_loss(
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        valid: torch.Tensor,
+        num_masks: float,
+    ):
+    """Binary mask loss normalized only over valid pixels."""
+    valid = valid.to(inputs)
+    loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none") * valid
+    denom = valid.sum(-1).clamp(min=1.0)
+    per_mask = loss.sum(-1) / denom
+    has_valid = valid.sum(-1) > 0
+    per_mask = per_mask * has_valid.to(per_mask)
+    return per_mask.sum() / num_masks
 
 
 def calculate_uncertainty(logits):
@@ -169,6 +202,25 @@ class VideoSetCriterion(nn.Module):
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
+
+    @staticmethod
+    def _frame_is_valid(target):
+        value = target.get("frame_valid", True)
+        return bool(value.item()) if torch.is_tensor(value) else bool(value)
+
+    @staticmethod
+    def _label_is_exhaustive(target):
+        value = target.get("label_exhaustive", True)
+        return bool(value.item()) if torch.is_tensor(value) else bool(value)
+
+    def _filter_indices_by_frame_valid(self, targets, indices):
+        filtered = []
+        for target, (src_idx, tgt_idx) in zip(targets, indices):
+            if self._frame_is_valid(target):
+                filtered.append((src_idx, tgt_idx))
+            else:
+                filtered.append((src_idx[:0], tgt_idx[:0]))
+        return filtered
         
     def loss_ctxs(self, queries, targets, indices, loss_name='', loss_num=''):
         idx = self._get_src_permutation_idx(indices)
@@ -215,27 +267,52 @@ class VideoSetCriterion(nn.Module):
         assert "pred_logits" in outputs
         src_logits = outputs["pred_logits"].float()
 
-        idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        
-        # Ensure target class indices are within valid range to avoid errors
-        invalid_mask = (target_classes_o < 0) | (target_classes_o >= self.num_classes)
-        if invalid_mask.any():
-            unique_invalid = torch.unique(target_classes_o[invalid_mask])
-            print(
-                "[VideoSetCriterion] Found invalid class ids in targets:",
-                unique_invalid.tolist(),
-                "; num_classes =",
-                self.num_classes,
-            )
-            target_classes_o = target_classes_o.clamp(0, self.num_classes - 1)
-        
         target_classes = torch.full(
             src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
         )
-        target_classes[idx] = target_classes_o.to(target_classes)
+        supervise_query = torch.zeros(
+            src_logits.shape[:2], dtype=torch.bool, device=src_logits.device
+        )
 
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        for b, (target, (src_idx, tgt_idx)) in enumerate(zip(targets, indices)):
+            if not self._frame_is_valid(target):
+                continue
+
+            # Only exhaustive annotations can safely call every unmatched query
+            # "no-object". With partial/unknown annotations, supervise matched
+            # queries only and leave unmatched queries unconstrained.
+            if self._label_is_exhaustive(target):
+                supervise_query[b] = True
+            elif src_idx.numel() > 0:
+                supervise_query[b, src_idx] = True
+
+            if src_idx.numel() == 0:
+                continue
+
+            target_classes_o = target["labels"][tgt_idx].to(torch.int64)
+            invalid_mask = (target_classes_o < 0) | (target_classes_o >= self.num_classes)
+            if invalid_mask.any():
+                unique_invalid = torch.unique(target_classes_o[invalid_mask])
+                print(
+                    "[VideoSetCriterion] Found invalid class ids in targets:",
+                    unique_invalid.tolist(),
+                    "; num_classes =",
+                    self.num_classes,
+                )
+                target_classes_o = target_classes_o.clamp(0, self.num_classes - 1)
+            target_classes[b, src_idx] = target_classes_o.to(target_classes)
+
+        per_query_ce = F.cross_entropy(
+            src_logits.transpose(1, 2),
+            target_classes,
+            self.empty_weight,
+            reduction="none",
+        )
+        if supervise_query.any():
+            loss_ce = per_query_ce[supervise_query].mean()
+        else:
+            loss_ce = src_logits.sum() * 0.0
+
         losses = {"loss_ce": loss_ce}
         return losses
     
@@ -245,16 +322,32 @@ class VideoSetCriterion(nn.Module):
         """
         assert "pred_masks" in outputs
 
+        if sum(src.numel() for src, _ in indices) == 0:
+            zero = outputs["pred_masks"].sum() * 0.0
+            return {"loss_mask": zero, "loss_dice": zero}
+
         src_idx = self._get_src_permutation_idx(indices)
         src_masks = outputs["pred_masks"]
         src_masks = src_masks[src_idx]
         # Modified to handle video
         target_masks = torch.cat([t['masks'][i] for t, (_, i) in zip(targets, indices)]).to(src_masks)
 
+        valid_masks = []
+        for target, (_, tgt_idx) in zip(targets, indices):
+            if tgt_idx.numel() == 0:
+                continue
+            pixel_valid = target.get("pixel_valid")
+            if pixel_valid is None:
+                pixel_valid = torch.ones_like(target["masks"][tgt_idx[:1]], dtype=torch.bool)
+            pixel_valid = pixel_valid.to(src_masks).bool()
+            valid_masks.append(pixel_valid.expand(tgt_idx.numel(), -1, -1, -1))
+        valid_masks = torch.cat(valid_masks, dim=0)
+
         # No need to upsample predictions as we are using normalized coordinates :)
         # NT x 1 x H x W
         src_masks = src_masks.flatten(0, 1)[:, None]
         target_masks = target_masks.flatten(0, 1)[:, None]
+        valid_masks = valid_masks.flatten(0, 1)[:, None]
 
         with torch.no_grad():
             # sample point_coords
@@ -271,6 +364,12 @@ class VideoSetCriterion(nn.Module):
                 point_coords.to(target_masks),
                 align_corners=False,
             ).squeeze(1)
+            point_valid = point_sample(
+                valid_masks.float(),
+                point_coords.to(valid_masks),
+                align_corners=False,
+            ).squeeze(1)
+            point_valid = (point_valid > 0.5).to(point_labels)
 
         point_logits = point_sample(
             src_masks,
@@ -279,8 +378,12 @@ class VideoSetCriterion(nn.Module):
         ).squeeze(1)
 
         losses = {
-            "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
-            "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
+            "loss_mask": masked_sigmoid_ce_loss(
+                point_logits, point_labels, point_valid, num_masks
+            ),
+            "loss_dice": masked_dice_loss(
+                point_logits, point_labels, point_valid, num_masks
+            ),
         }
 
         del src_masks
@@ -320,12 +423,16 @@ class VideoSetCriterion(nn.Module):
         else:
             outputs_without_aux = {k: v for k, v in matcher_outputs.items() if k != "aux_outputs"}
 
-        # Retrieve the matching between the outputs of the last layer and the targets
+        # Match on the full clip to preserve temporal identity, then suppress
+        # losses on context-only frames.
         indices = self.matcher(outputs_without_aux, targets)
+        loss_indices = self._filter_indices_by_frame_valid(targets, indices)
         # [per image indicates], per image indicates -> (pred inds, gt inds)
 
-        # Compute the average number of target boxes accross all nodes, for normalization purposes
-        num_masks = sum(len(t["labels"]) for t in targets)
+        # Normalize only by supervised target slots.
+        num_masks = sum(
+            len(t["labels"]) for t in targets if self._frame_is_valid(t)
+        )
         num_masks = torch.as_tensor(
             [num_masks], dtype=torch.float, device=next(iter(outputs.values())).device
         )
@@ -336,12 +443,12 @@ class VideoSetCriterion(nn.Module):
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
+            losses.update(self.get_loss(loss, outputs, targets, loss_indices, num_masks))
             
         
         # Contrastive losses between context-aware instance embeddings
         if 'pred_reid_embed' in outputs:
-            ctx_loss = self.loss_ctxs(outputs['pred_reid_embed'], targets, indices, loss_name='loss_ctx')
+            ctx_loss = self.loss_ctxs(outputs['pred_reid_embed'], targets, loss_indices, loss_name='loss_ctx')
             losses.update(ctx_loss)
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
@@ -349,8 +456,9 @@ class VideoSetCriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
                 if matcher_outputs is None:
                     indices = self.matcher(aux_outputs, targets)
+                aux_loss_indices = self._filter_indices_by_frame_valid(targets, indices)
                 for loss in self.losses:
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks)
+                    l_dict = self.get_loss(loss, aux_outputs, targets, aux_loss_indices, num_masks)
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
                     

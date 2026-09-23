@@ -1,0 +1,20 @@
+_BASE_: "../VSPW/videomt/dinov2/vit-large/videomt_online_ViTL.yaml"
+
+MODEL:
+  META_ARCHITECTURE: "videomt_online"
+  BACKBONE:
+    NUM_CLASSES: 3
+    TEST:
+      TASK: "sphive"
+
+DATASETS:
+  TRAIN: ("datasets/sphive/train.jsonl",)
+  TEST: ("datasets/sphive/val.jsonl",)
+  DATASET_TYPE: ["sphive"]
+  DATASET_TYPE_TEST: ["sphive"]
+  DATASET_RATIO: [1.0]
+  DATASET_NEED_MAP: [False]
+  TAXONOMY_FILE: "datasets/sphive/taxonomy.json"
+
+INPUT:
+  SAMPLING_FRAME_NUM: 5

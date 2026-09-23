@@ -231,7 +231,7 @@ class YTVISDatasetMapper:
 
         return ret
 
-    def select_frames(self, video_length):
+    def select_frames(self, video_length, labeled_indices=None):
         """
         Args:
             video_length (int): length of the video
@@ -239,6 +239,8 @@ class YTVISDatasetMapper:
         Returns:
             selected_idx (list[int]): a list of selected frame indices
         """
+        labeled_indices = [] if labeled_indices is None else list(labeled_indices)
+
         if self.sampling_frame_ratio < 1.0:
             assert self.sampling_frame_num == 1, "only support subsampling for a single frame"
             subsampled_frames = max(int(np.round(video_length * self.sampling_frame_ratio)), 1)
@@ -260,15 +262,20 @@ class YTVISDatasetMapper:
                 else:
                     if video_length == self.sampling_frame_num:
                         start_idx = 0
+                    elif labeled_indices:
+                        anchor = random.choice(labeled_indices)
+                        min_start = max(0, anchor - self.sampling_frame_num + 1)
+                        max_start = min(anchor, video_length - self.sampling_frame_num)
+                        start_idx = random.randint(min_start, max_start)
                     else:
-                        start_idx = random.randrange(video_length - self.sampling_frame_num)
+                        start_idx = random.randrange(video_length - self.sampling_frame_num + 1)
                     end_idx = start_idx + self.sampling_frame_num
                     selected_idx = np.arange(start_idx, end_idx).tolist()
                 if self.reverse_agu and random.random() < 0.5:
                     selected_idx = selected_idx[::-1]
                 return selected_idx
 
-            ref_frame = random.randrange(video_length)
+            ref_frame = random.choice(labeled_indices) if labeled_indices else random.randrange(video_length)
 
             start_idx = max(0, ref_frame-self.sampling_frame_range)
             end_idx = min(video_length, ref_frame+self.sampling_frame_range + 1)
@@ -294,12 +301,21 @@ class YTVISDatasetMapper:
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
 
         video_length = dataset_dict["length"]
+        source_gt_valid = dataset_dict.pop("gt_valid", None)
+        if source_gt_valid is None:
+            source_gt_valid = [True] * video_length
+        else:
+            source_gt_valid = [bool(x) for x in source_gt_valid]
+            assert len(source_gt_valid) == video_length
+
         if self.is_train:
-            selected_idx = self.select_frames(video_length)
+            labeled_indices = [i for i, valid in enumerate(source_gt_valid) if valid]
+            selected_idx = self.select_frames(video_length, labeled_indices=labeled_indices)
             if self.sampling_frame_shuffle:
                 random.shuffle(selected_idx)
         else:
             selected_idx = range(video_length)
+        selected_idx = list(selected_idx)
 
         video_annos = dataset_dict.pop("annotations", None)
         file_names = dataset_dict.pop("file_names", None)
@@ -307,13 +323,16 @@ class YTVISDatasetMapper:
         if self.is_train:
             _ids = set()
             for frame_idx in selected_idx:
+                if not source_gt_valid[frame_idx]:
+                    continue
                 _ids.update([anno["id"] for anno in video_annos[frame_idx]])
             ids = dict()
             for i, _id in enumerate(_ids):
                 ids[_id] = i
 
-        dataset_dict["video_len"] = len(video_annos)
+        dataset_dict["video_len"] = video_length
         dataset_dict["frame_idx"] = list(selected_idx)
+        dataset_dict["gt_valid"] = [source_gt_valid[idx] for idx in selected_idx]
         dataset_dict["image"] = []
         dataset_dict["instances"] = []
         dataset_dict["file_names"] = []
@@ -339,11 +358,12 @@ class YTVISDatasetMapper:
 
             # NOTE copy() is to prevent annotations getting changed from applying augmentations
             _frame_annos = []
-            for anno in video_annos[frame_idx]:
-                _anno = {}
-                for k, v in anno.items():
-                    _anno[k] = copy.deepcopy(v)
-                _frame_annos.append(_anno)
+            if source_gt_valid[frame_idx]:
+                for anno in video_annos[frame_idx]:
+                    _anno = {}
+                    for k, v in anno.items():
+                        _anno[k] = copy.deepcopy(v)
+                    _frame_annos.append(_anno)
 
             # USER: Implement additional transformations if you have other types of data
             annos = [

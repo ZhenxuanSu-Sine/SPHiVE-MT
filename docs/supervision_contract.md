@@ -1,56 +1,20 @@
-# SPHiVE-MT supervision contract
+# Supervision rules
 
-SPHiVE-MT separates temporal context from supervision. A frame may be used by
-the video model even when no segmentation loss is allowed on that frame.
+SPHiVE-MT keeps temporal context and supervision separate.
 
-## Frame-level supervision
+1. **Frame validity**  
+   `supervision: null` means the frame is context-only. It still updates temporal queries but contributes no matching or loss.
 
-`gt_valid: List[bool]`, length `T`.
+2. **Pixel validity**  
+   `valid_mask=0` means unknown / ignore. These pixels are excluded from matching cost and mask losses.
 
-- `True`: the frame contains usable annotation.
-- `False`: the frame is context-only.
-- Context-only frames still participate in the forward pass and query
-  propagation, but they do not contribute matching, classification, BCE, or
-  Dice loss.
+3. **Taxonomy supervision**  
+   Labels supervise the taxonomy node they are attached to. Coarser labels stay coarse; child classes are not guessed.
 
-This is the primary mechanism for dense raw video with sparse GT, e.g. 20 Hz
-images with 2/5/10/20 Hz annotation.
+4. **Far vs. instance**  
+   `far=false` gives instance supervision. `far=true` gives semantic supervision only. Both contribute to semantic masks.
 
-## Pixel-level supervision
+5. **Negative information**  
+   Only nodes listed in `exhaustive_node_ids` may be treated as fully known. Missing annotations outside those nodes remain unknown.
 
-`pixel_valid_masks: BoolTensor[T, H, W]`.
-
-- `True`: the pixel is supervised.
-- `False`: the pixel is unknown / ignored, not background.
-
-The validity mask is applied to both Hungarian mask costs and BCE/Dice losses.
-For semantic datasets, it is derived from the dataset ignore label. Frames with
-no valid pixels are treated as context-only.
-
-## Exhaustive-label supervision
-
-`label_exhaustive: List[bool]`, length `T`.
-
-This controls whether unmatched queries may be trained as `no-object`.
-
-- `True`: the annotation is exhaustive enough to treat unmatched queries as
-  negatives.
-- `False`: unmatched queries are left unsupervised; only matched queries
-  receive classification supervision.
-
-Semantic frames containing ignore/unknown pixels default to non-exhaustive.
-Fully annotated VIS frames remain exhaustive by default.
-
-This distinction is required for partial annotations: an unannotated object or
-region must not become an implicit negative example.
-
-## Relationship
-
-The three masks are intentionally orthogonal:
-
-1. `gt_valid` answers: should this frame contribute any loss?
-2. `pixel_valid_masks` answers: which pixels may contribute mask loss?
-3. `label_exhaustive` answers: may unmatched queries be called background?
-
-Future hierarchical / partial-label supervision should build on this contract
-rather than encoding unknown labels as background.
+The loader may derive internal fields such as frame-valid masks, pixel-valid masks, and query-level negative masks from this metadata.

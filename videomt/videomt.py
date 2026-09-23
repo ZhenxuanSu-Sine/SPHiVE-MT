@@ -1629,6 +1629,59 @@ class videomt_online(videomt):
                 "task": "vps",
             }
 
+    def inference_video_sphive(
+        self, pred_cls, pred_masks, img_size, output_height, output_width,
+        first_resize_size, pred_id, aux_pred_cls=None,
+    ):
+        """Minimal unified inference.
+
+        Returns query-level instance candidates and overlapping semantic score
+        maps for every taxonomy node. Panoptic conflict resolution is left to a
+        later post-processing stage.
+        """
+        if self.taxonomy is None:
+            raise ValueError("SPHiVE inference requires a taxonomy")
+
+        class_probs = F.softmax(pred_cls, dim=-1)[:, :-1]
+        cur_masks = F.interpolate(
+            pred_masks, size=first_resize_size, mode="bilinear", align_corners=False
+        )
+        cur_masks = cur_masks[:, :, : img_size[0], : img_size[1]].sigmoid()
+        cur_masks = F.interpolate(
+            cur_masks,
+            size=(output_height, output_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        query_scores, query_labels = class_probs.max(-1)
+        keep = query_scores > self.object_mask_threshold
+        kept_masks = cur_masks[keep]
+        kept_ids = pred_id[keep]
+        kept_scores = query_scores[keep]
+        kept_labels = query_labels[keep]
+
+        descendants = self.taxonomy.descendant_matrix.to(class_probs.device)
+        semantic_scores = []
+        for node in range(self.taxonomy.num_nodes):
+            subtree_prob = class_probs[:, descendants[node]].sum(-1)
+            contribution = subtree_prob[:, None, None, None] * cur_masks
+            semantic = 1.0 - torch.prod(
+                1.0 - contribution.clamp(0.0, 1.0 - 1e-6), dim=0
+            )
+            semantic_scores.append(semantic)
+        semantic_scores = torch.stack(semantic_scores, dim=0)
+
+        return {
+            "image_size": (output_height, output_width),
+            "query_scores": kept_scores.cpu(),
+            "query_labels": kept_labels.cpu(),
+            "query_masks": (kept_masks > 0.5).cpu(),
+            "query_ids": kept_ids.cpu(),
+            "semantic_scores": semantic_scores.cpu(),
+            "task": "sphive",
+        }
+
     def inference_video_vss(
         self, pred_cls, pred_masks, img_size, output_height, output_width,
         first_resize_size, pred_id, aux_pred_cls=None,

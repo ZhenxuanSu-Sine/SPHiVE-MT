@@ -87,3 +87,38 @@ Exhaustiveness is node-specific and does not automatically propagate to parents 
 - valid = 0: unknown / ignore, not background.
 
 If omitted, the whole frame is valid.
+
+
+## Taxonomy
+
+Taxonomy is a separate JSON file. Node ids must be contiguous from 0 to N-1.
+
+```json
+{
+  "nodes": [
+    {"id": 0, "name": "traffic_participant", "parent": null},
+    {"id": 1, "name": "vehicle", "parent": 0},
+    {"id": 2, "name": "regular_vehicle", "parent": 1}
+  ]
+}
+```
+
+The model uses the tree to expand parent supervision to its subtree. A label on `vehicle` does not guess which child is correct.
+
+## Training
+
+Use `DATASET_TYPE: ["sphive"]`, set `DATASETS.TRAIN` to the JSONL manifest path, and set `DATASETS.TAXONOMY_FILE` to the taxonomy JSON.
+
+Current VidEoMT training uses a fixed temporal length per run:
+
+- true single-frame training: `INPUT.SAMPLING_FRAME_NUM: 1`
+- sparse video supervision: use `T>1`; unlabeled frames keep `supervision: null`
+
+## Minimal inference output
+
+`TEST.TASK: "sphive"` returns:
+
+- query scores / labels / masks / ids
+- overlapping semantic score maps for every taxonomy node
+
+Panoptic conflict resolution is intentionally left for later.

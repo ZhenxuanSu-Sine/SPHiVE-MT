@@ -1412,7 +1412,8 @@ class videomt_online(videomt):
         for targets_per_video in targets:
             num_labeled_frames = targets_per_video['ids'].shape[1]
             for f in range(num_labeled_frames):
-                labels = targets_per_video['labels']
+                labels_all = targets_per_video['labels']
+                labels = labels_all[:, f] if labels_all.ndim == 2 else labels_all
                 ids = targets_per_video['ids'][:, [f]]
                 masks = targets_per_video['masks'][:, [f], :, :]
                 frame_valid = targets_per_video.get("frame_valid")

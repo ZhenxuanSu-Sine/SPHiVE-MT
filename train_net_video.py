@@ -83,8 +83,12 @@ class Trainer(DefaultTrainer):
             os.makedirs(output_folder, exist_ok=True)
 
         evaluator_dict = {'vis': YTVISEvaluator, 'vss': VSSEvaluator, 'vps': VPSEvaluator}
-        assert cfg.MODEL.BACKBONE.TEST.TASK in evaluator_dict.keys()
-        return evaluator_dict[cfg.MODEL.BACKBONE.TEST.TASK](dataset_name, cfg, True, output_folder)
+        task = cfg.MODEL.BACKBONE.TEST.TASK
+        if task == 'sphive':
+            raise NotImplementedError("SPHiVE evaluator is not defined yet; use tools/infer_sphive.py")
+        if task not in evaluator_dict:
+            raise NotImplementedError(f"Unsupported evaluation task: {task}")
+        return evaluator_dict[task](dataset_name, cfg, True, output_folder)
 
     @classmethod
     def build_train_loader(cls, cfg):

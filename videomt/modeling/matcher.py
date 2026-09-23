@@ -103,7 +103,14 @@ class VideoHungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, num_points: int = 0):
+    def __init__(
+        self,
+        cost_class: float = 1,
+        cost_mask: float = 1,
+        cost_dice: float = 1,
+        num_points: int = 0,
+        descendant_matrix=None,
+    ):
         """Creates the matcher
 
         Params:
@@ -119,6 +126,7 @@ class VideoHungarianMatcher(nn.Module):
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
 
         self.num_points = num_points
+        self.descendant_matrix = descendant_matrix
 
     @torch.no_grad()
     def memory_efficient_forward(self, outputs, targets):
@@ -160,7 +168,12 @@ class VideoHungarianMatcher(nn.Module):
             # Compute the classification cost. Contrary to the loss, we don't use the NLL,
             # but approximate it in 1 - proba[target class].
             # The 1 is a constant that doesn't change the matching, it can be ommitted.
-            cost_class = -out_prob[:, tgt_ids]
+            if self.descendant_matrix is None:
+                cost_class = -out_prob[:, tgt_ids]
+            else:
+                descendants = self.descendant_matrix.to(out_prob.device)
+                allowed = descendants[tgt_ids].to(out_prob.dtype)  # [num_gt, C]
+                cost_class = -(out_prob[:, :allowed.shape[1]] @ allowed.T)
 
             out_mask = outputs["pred_masks"][b]  # [num_queries, T, H_pred, W_pred]
             # gt masks are already padded when preparing target
@@ -254,12 +267,21 @@ class VideoHungarianMatcher_Consistent(VideoHungarianMatcher):
     """
     Only match in the first frame where the object appears in the GT.
     """
-    def __init__(self, cost_class: float = 1, cost_mask: float = 1,
-                 cost_dice: float = 1, num_points: int = 0,
-                 frames: int = 5):
+    def __init__(
+        self,
+        cost_class: float = 1,
+        cost_mask: float = 1,
+        cost_dice: float = 1,
+        num_points: int = 0,
+        frames: int = 5,
+        descendant_matrix=None,
+    ):
         super().__init__(
-            cost_class=cost_class, cost_mask=cost_mask,
-            cost_dice=cost_dice, num_points=num_points,
+            cost_class=cost_class,
+            cost_mask=cost_mask,
+            cost_dice=cost_dice,
+            num_points=num_points,
+            descendant_matrix=descendant_matrix,
         )
         self.frames = frames
 
@@ -320,7 +342,12 @@ class VideoHungarianMatcher_Consistent(VideoHungarianMatcher):
                 # Compute the classification cost. Contrary to the loss, we don't use the NLL,
                 # but approximate it in 1 - proba[target class].
                 # The 1 is a constant that doesn't change the matching, it can be ommitted.
+                if self.descendant_matrix is None:
                 cost_class = -out_prob[:, tgt_ids]
+            else:
+                descendants = self.descendant_matrix.to(out_prob.device)
+                allowed = descendants[tgt_ids].to(out_prob.dtype)  # [num_gt, C]
+                cost_class = -(out_prob[:, :allowed.shape[1]] @ allowed.T)
 
                 out_mask = outputs["pred_masks"][overall_bs]  # [num_queries, T, H_pred, W_pred]
                 # gt masks are already padded when preparing target

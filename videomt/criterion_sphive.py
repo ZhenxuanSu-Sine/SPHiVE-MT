@@ -1,1 +1,166 @@
-import torch\nimport torch.nn.functional as F\n\nfrom detectron2.utils.comm import get_world_size\n\nfrom .criterion_videomt import VideoSetCriterion\nfrom .utils.misc import is_dist_avail_and_initialized\n\n\nclass SPHiVESetCriterion(VideoSetCriterion):\n    """SPHiVE loss: instance set loss + taxonomy semantic projection loss."""\n\n    def __init__(self, *args, descendant_matrix, **kwargs):\n        super().__init__(*args, **kwargs)\n        self.register_buffer(\n            "descendant_matrix", descendant_matrix.to(torch.bool), persistent=False\n        )\n\n    def _filter_indices_by_frame_valid(self, targets, indices):\n        """Keep only supervised and visible instance targets."""\n        filtered = []\n        for target, (src_idx, tgt_idx) in zip(targets, indices):\n            if not self._frame_is_valid(target) or tgt_idx.numel() == 0:\n                filtered.append((src_idx[:0], tgt_idx[:0]))\n                continue\n            ids = target["ids"][tgt_idx].reshape(-1)\n            keep = ids != -1\n            filtered.append((src_idx[keep], tgt_idx[keep]))\n        return filtered\n\n    def loss_labels(self, outputs, targets, indices, num_masks):\n        """Matched-only hierarchical classification loss.\n\n        A target at node u accepts predictions at u or any descendant of u.\n        Unmatched queries are intentionally not forced to no-object because\n        far/partial regions may contain valid but non-instantiated entities.\n        """\n        logits = outputs["pred_logits"].float()\n        probs = logits.softmax(-1)[..., : self.num_classes]\n        losses = []\n        for b, (target, (src_idx, tgt_idx)) in enumerate(zip(targets, indices)):\n            if src_idx.numel() == 0:\n                continue\n            target_nodes = target["labels"][tgt_idx].long()\n            allowed = self.descendant_matrix[target_nodes].to(probs)\n            subtree_prob = (probs[b, src_idx] * allowed).sum(-1)\n            losses.append(-torch.log(subtree_prob.clamp_min(1e-8)))\n        if not losses:\n            return {"loss_ce": logits.sum() * 0.0}\n        return {"loss_ce": torch.cat(losses).mean()}\n\n    def loss_semantic_projection(self, outputs, targets):\n        """Project all queries to exhaustive taxonomy nodes and supervise unions."""\n        logits = outputs["pred_logits"].float()\n        class_probs = logits.softmax(-1)[..., : self.num_classes]\n        mask_probs = outputs["pred_masks"].float().sigmoid()[:, :, 0]\n\n        bce_terms = []\n        dice_terms = []\n        for b, target in enumerate(targets):\n            if not self._frame_is_valid(target):\n                continue\n            exhaustive = target.get("exhaustive_node_ids")\n            if exhaustive is None or exhaustive.numel() == 0:\n                continue\n\n            region_nodes = target.get("region_node_ids")\n            region_masks = target.get("region_masks")\n            pixel_valid = target.get("pixel_valid")\n\n            pred_h, pred_w = mask_probs.shape[-2:]\n            if pixel_valid is None:\n                valid = torch.ones(\n                    (pred_h, pred_w), dtype=torch.bool, device=mask_probs.device\n                )\n            else:\n                valid = F.interpolate(\n                    pixel_valid[None].float().to(mask_probs),\n                    size=(pred_h, pred_w),\n                    mode="nearest",\n                )[0, 0].bool()\n\n            if region_masks is not None and region_masks.numel() > 0:\n                gt_regions = F.interpolate(\n                    region_masks.float().to(mask_probs),\n                    size=(pred_h, pred_w),\n                    mode="nearest",\n                )[:, 0].bool()\n            else:\n                gt_regions = None\n\n            for node in exhaustive.long():\n                subtree = self.descendant_matrix[node].to(class_probs.device)\n                query_prob = class_probs[b, :, subtree].sum(-1)\n                contribution = query_prob[:, None, None] * mask_probs[b]\n                pred = 1.0 - torch.prod(\n                    1.0 - contribution.clamp(0.0, 1.0 - 1e-6), dim=0\n                )\n\n                gt = torch.zeros_like(pred, dtype=torch.bool)\n                if gt_regions is not None:\n                    include = self.descendant_matrix[\n                        node, region_nodes.long().to(self.descendant_matrix.device)\n                    ]\n                    if include.any():\n                        gt = gt_regions[include.to(gt_regions.device)].any(dim=0)\n\n                if not valid.any():\n                    continue\n                pred_v = pred[valid].clamp(1e-6, 1.0 - 1e-6)\n                gt_v = gt[valid].to(pred_v)\n                bce_terms.append(F.binary_cross_entropy(pred_v, gt_v))\n\n                numerator = 2.0 * (pred_v * gt_v).sum()\n                denominator = pred_v.sum() + gt_v.sum()\n                dice_terms.append(1.0 - (numerator + 1.0) / (denominator + 1.0))\n\n        zero = outputs["pred_masks"].sum() * 0.0\n        loss_bce = torch.stack(bce_terms).mean() if bce_terms else zero\n        loss_dice = torch.stack(dice_terms).mean() if dice_terms else zero\n        return {\n            "loss_semantic_mask": loss_bce,\n            "loss_semantic_dice": loss_dice,\n        }\n\n    def forward(self, outputs, targets, matcher_outputs=None, ret_match_result=False):\n        if matcher_outputs is None:\n            match_outputs = {k: v for k, v in outputs.items() if k != "aux_outputs"}\n        else:\n            match_outputs = {k: v for k, v in matcher_outputs.items() if k != "aux_outputs"}\n\n        indices = self.matcher(match_outputs, targets)\n        loss_indices = self._filter_indices_by_frame_valid(targets, indices)\n\n        num_masks = sum(\n            int((target["ids"].reshape(-1) != -1).sum().item())\n            for target in targets\n            if self._frame_is_valid(target)\n        )\n        num_masks = torch.as_tensor(\n            [num_masks], dtype=torch.float, device=next(iter(outputs.values())).device\n        )\n        if is_dist_avail_and_initialized():\n            torch.distributed.all_reduce(num_masks)\n        num_masks = torch.clamp(num_masks / get_world_size(), min=1).item()\n\n        losses = {}\n        for loss in self.losses:\n            losses.update(\n                self.get_loss(loss, outputs, targets, loss_indices, num_masks)\n            )\n        losses.update(self.loss_semantic_projection(outputs, targets))\n\n        if "aux_outputs" in outputs:\n            for i, aux_outputs in enumerate(outputs["aux_outputs"]):\n                aux_indices = self.matcher(aux_outputs, targets)\n                aux_indices = self._filter_indices_by_frame_valid(targets, aux_indices)\n                for loss in self.losses:\n                    loss_dict = self.get_loss(\n                        loss, aux_outputs, targets, aux_indices, num_masks\n                    )\n                    losses.update({k + f"_{i}": v for k, v in loss_dict.items()})\n\n        if ret_match_result:\n            return losses, indices\n        return losses
+import torch
+import torch.nn.functional as F
+
+from detectron2.utils.comm import get_world_size
+
+from .criterion_videomt import VideoSetCriterion
+from .utils.misc import is_dist_avail_and_initialized
+
+
+class SPHiVESetCriterion(VideoSetCriterion):
+    """SPHiVE loss: instance set loss + taxonomy semantic projection loss."""
+
+    def __init__(self, *args, descendant_matrix, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register_buffer(
+            "descendant_matrix", descendant_matrix.to(torch.bool), persistent=False
+        )
+
+    def _filter_indices_by_frame_valid(self, targets, indices):
+        """Keep only supervised and visible instance targets."""
+        filtered = []
+        for target, (src_idx, tgt_idx) in zip(targets, indices):
+            if not self._frame_is_valid(target) or tgt_idx.numel() == 0:
+                filtered.append((src_idx[:0], tgt_idx[:0]))
+                continue
+            ids = target["ids"][tgt_idx].reshape(-1)
+            keep = ids != -1
+            filtered.append((src_idx[keep], tgt_idx[keep]))
+        return filtered
+
+    def loss_labels(self, outputs, targets, indices, num_masks):
+        """Matched-only hierarchical classification loss.
+
+        A target at node u accepts predictions at u or any descendant of u.
+        Unmatched queries are intentionally not forced to no-object because
+        far/partial regions may contain valid but non-instantiated entities.
+        """
+        logits = outputs["pred_logits"].float()
+        probs = logits.softmax(-1)[..., : self.num_classes]
+        losses = []
+        for b, (target, (src_idx, tgt_idx)) in enumerate(zip(targets, indices)):
+            if src_idx.numel() == 0:
+                continue
+            target_nodes = target["labels"][tgt_idx].long()
+            allowed = self.descendant_matrix[target_nodes].to(probs)
+            subtree_prob = (probs[b, src_idx] * allowed).sum(-1)
+            losses.append(-torch.log(subtree_prob.clamp_min(1e-8)))
+        if not losses:
+            return {"loss_ce": logits.sum() * 0.0}
+        return {"loss_ce": torch.cat(losses).mean()}
+
+    def loss_semantic_projection(self, outputs, targets):
+        """Project all queries to exhaustive taxonomy nodes and supervise unions."""
+        logits = outputs["pred_logits"].float()
+        class_probs = logits.softmax(-1)[..., : self.num_classes]
+        mask_probs = outputs["pred_masks"].float().sigmoid()[:, :, 0]
+
+        bce_terms = []
+        dice_terms = []
+        for b, target in enumerate(targets):
+            if not self._frame_is_valid(target):
+                continue
+            exhaustive = target.get("exhaustive_node_ids")
+            if exhaustive is None or exhaustive.numel() == 0:
+                continue
+
+            region_nodes = target.get("region_node_ids")
+            region_masks = target.get("region_masks")
+            pixel_valid = target.get("pixel_valid")
+
+            pred_h, pred_w = mask_probs.shape[-2:]
+            if pixel_valid is None:
+                valid = torch.ones(
+                    (pred_h, pred_w), dtype=torch.bool, device=mask_probs.device
+                )
+            else:
+                valid = F.interpolate(
+                    pixel_valid[None].float().to(mask_probs),
+                    size=(pred_h, pred_w),
+                    mode="nearest",
+                )[0, 0].bool()
+
+            if region_masks is not None and region_masks.numel() > 0:
+                gt_regions = F.interpolate(
+                    region_masks.float().to(mask_probs),
+                    size=(pred_h, pred_w),
+                    mode="nearest",
+                )[:, 0].bool()
+            else:
+                gt_regions = None
+
+            for node in exhaustive.long():
+                subtree = self.descendant_matrix[node].to(class_probs.device)
+                query_prob = class_probs[b, :, subtree].sum(-1)
+                contribution = query_prob[:, None, None] * mask_probs[b]
+                pred = 1.0 - torch.prod(
+                    1.0 - contribution.clamp(0.0, 1.0 - 1e-6), dim=0
+                )
+
+                gt = torch.zeros_like(pred, dtype=torch.bool)
+                if gt_regions is not None:
+                    include = self.descendant_matrix[
+                        node, region_nodes.long().to(self.descendant_matrix.device)
+                    ]
+                    if include.any():
+                        gt = gt_regions[include.to(gt_regions.device)].any(dim=0)
+
+                if not valid.any():
+                    continue
+                pred_v = pred[valid].clamp(1e-6, 1.0 - 1e-6)
+                gt_v = gt[valid].to(pred_v)
+                bce_terms.append(F.binary_cross_entropy(pred_v, gt_v))
+
+                numerator = 2.0 * (pred_v * gt_v).sum()
+                denominator = pred_v.sum() + gt_v.sum()
+                dice_terms.append(1.0 - (numerator + 1.0) / (denominator + 1.0))
+
+        zero = outputs["pred_masks"].sum() * 0.0
+        loss_bce = torch.stack(bce_terms).mean() if bce_terms else zero
+        loss_dice = torch.stack(dice_terms).mean() if dice_terms else zero
+        return {
+            "loss_semantic_mask": loss_bce,
+            "loss_semantic_dice": loss_dice,
+        }
+
+    def forward(self, outputs, targets, matcher_outputs=None, ret_match_result=False):
+        if matcher_outputs is None:
+            match_outputs = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+        else:
+            match_outputs = {k: v for k, v in matcher_outputs.items() if k != "aux_outputs"}
+
+        indices = self.matcher(match_outputs, targets)
+        loss_indices = self._filter_indices_by_frame_valid(targets, indices)
+
+        num_masks = sum(
+            int((target["ids"].reshape(-1) != -1).sum().item())
+            for target in targets
+            if self._frame_is_valid(target)
+        )
+        num_masks = torch.as_tensor(
+            [num_masks], dtype=torch.float, device=next(iter(outputs.values())).device
+        )
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_masks)
+        num_masks = torch.clamp(num_masks / get_world_size(), min=1).item()
+
+        losses = {}
+        for loss in self.losses:
+            losses.update(
+                self.get_loss(loss, outputs, targets, loss_indices, num_masks)
+            )
+        losses.update(self.loss_semantic_projection(outputs, targets))
+
+        if "aux_outputs" in outputs:
+            for i, aux_outputs in enumerate(outputs["aux_outputs"]):
+                aux_indices = self.matcher(aux_outputs, targets)
+                aux_indices = self._filter_indices_by_frame_valid(targets, aux_indices)
+                for loss in self.losses:
+                    loss_dict = self.get_loss(
+                        loss, aux_outputs, targets, aux_indices, num_masks
+                    )
+                    losses.update({k + f"_{i}": v for k, v in loss_dict.items()})
+
+        if ret_match_result:
+            return losses, indices
+        return losses

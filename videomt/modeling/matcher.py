@@ -343,11 +343,11 @@ class VideoHungarianMatcher_Consistent(VideoHungarianMatcher):
                 # but approximate it in 1 - proba[target class].
                 # The 1 is a constant that doesn't change the matching, it can be ommitted.
                 if self.descendant_matrix is None:
-                cost_class = -out_prob[:, tgt_ids]
-            else:
-                descendants = self.descendant_matrix.to(out_prob.device)
-                allowed = descendants[tgt_ids].to(out_prob.dtype)  # [num_gt, C]
-                cost_class = -(out_prob[:, :allowed.shape[1]] @ allowed.T)
+                    cost_class = -out_prob[:, tgt_ids]
+                else:
+                    descendants = self.descendant_matrix.to(out_prob.device)
+                    allowed = descendants[tgt_ids].to(out_prob.dtype)  # [num_gt, C]
+                    cost_class = -(out_prob[:, :allowed.shape[1]] @ allowed.T)
 
                 out_mask = outputs["pred_masks"][overall_bs]  # [num_queries, T, H_pred, W_pred]
                 # gt masks are already padded when preparing target
